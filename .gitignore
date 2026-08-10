@@ -1,0 +1,16 @@
+# Build output
+build/
+*.o
+
+# Binaries and runtime DLLs
+*.exe
+*.dll
+
+# Vendored dependencies (download SDL3 / SDL3_ttf into deps/)
+deps/
+
+# Separate reference project (ip_graph) is tracked in its own repo
+ip_graph/
+
+# Local config
+config.json
