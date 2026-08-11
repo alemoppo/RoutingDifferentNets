@@ -358,6 +358,9 @@ static void dlg_append(App *a, const char *txt)
 
 /* ============================================================ reconcile */
 
+static BOOL route_is_ours(const App *a, const HostRoute *hr,
+                          const RouteConfigItem *it);
+
 static void reconcile(App *a, int force)
 {
     (void)force;   /* le correzioni sono automatiche ed event-driven */
@@ -402,6 +405,7 @@ static void reconcile(App *a, int force)
             snprintf(a->actual_if[j], sizeof(a->actual_if[j]), "%s",
                      ni->friendly_name);
             a->st[j] = ROUTE_STATUS_OK; nok++;
+            cfg_set_last(a->cfg, it->ip, ni->gateway, ni->ifindex);
             dbg("[ROUTE] %s/32 OK (if %lu gw %s)", it->ip, ni->ifindex,
                 ni->gateway);
             continue;
@@ -417,11 +421,7 @@ static void reconcile(App *a, int force)
             const HostRoute *hr = &a->routes.items[k];
             if (hr->prefix_len != 32 || strcmp(hr->ip, it->ip) != 0)
                 continue;
-            int idx = net_index_of_ifindex(&a->nets, hr->ifindex);
-            int ours = (idx < 0) ||
-                       (a->nets.items[idx].guid[0] &&
-                        _stricmp(a->nets.items[idx].guid, it->guid) == 0);
-            if (!ours)
+            if (!route_is_ours(a, hr, it))
                 continue;   /* route di un'altra interfaccia: la lasciamo */
             route_delete(it->ip, hr->gateway, hr->ifindex, eb, sizeof(eb));
             stale = 1;
@@ -438,6 +438,7 @@ static void reconcile(App *a, int force)
                 snprintf(a->actual_if[j], sizeof(a->actual_if[j]), "%s",
                          ni->friendly_name);
                 a->st[j] = ROUTE_STATUS_OK; nok++;
+                cfg_set_last(a->cfg, it->ip, ni->gateway, ni->ifindex);
                 dbg("[ROUTE] %s/32 corretta -> %s (if %lu gw %s)",
                     it->ip, ni->friendly_name, ni->ifindex, ni->gateway);
             } else {
@@ -1001,23 +1002,47 @@ static int import_system_routes(App *a)
 
 /* Elimina le route /32 verso `ip` che appartengono all'interfaccia `guid`
  * (stesso GUID) oppure che puntano a un ifIndex non piu' presente nella rete.
- * Le route di terze parti (es. VPN) restano intatte. Usata alla rimozione di
- * una regola quando l'interfaccia e' offline o assente. */
+ * Se l'interfaccia non e' piu' presente usa gli ULTIMI parametri noti salvati
+ * in config per rimuovere anche la voce persistente in modo esatto. Le route
+ * di terze parti (es. VPN) restano intatte. */
+static BOOL route_is_ours(const App *a, const HostRoute *hr,
+                          const RouteConfigItem *it)
+{
+    int idx = net_index_of_ifindex(&a->nets, hr->ifindex);
+    if (idx < 0)
+        return TRUE;   /* ifIndex non piu' presente: resto nostro */
+    const NetInterface *ni = net_resolve(&a->nets, it->guid, it->name);
+    return ni && ni->ifindex == hr->ifindex;
+}
+
 static void delete_owned_routes(App *a, const char *ip, const char *guid)
 {
+    (void)guid;   /* la proprieta' e' decisa da route_is_ours */
     routes_snapshot(&a->routes);
     char eb[128];
+    int removed_persistent = 0;
     for (int k = 0; k < a->routes.count; k++) {
         const HostRoute *hr = &a->routes.items[k];
         if (hr->prefix_len != 32 || strcmp(hr->ip, ip) != 0)
             continue;
-        int idx = net_index_of_ifindex(&a->nets, hr->ifindex);
-        int ours = (idx < 0) ||
-                   (a->nets.items[idx].guid[0] &&
-                    _stricmp(a->nets.items[idx].guid, guid) == 0);
-        if (!ours)
+        int idx = cfg_find(a->cfg, ip);
+        if (idx < 0)
+            continue;
+        const RouteConfigItem *it = &a->cfg->items[idx];
+        if (!route_is_ours(a, hr, it))
             continue;
         route_delete(ip, hr->gateway, hr->ifindex, eb, sizeof(eb));
+        removed_persistent = 1;
+    }
+    /* Interfaccia assente: se non abbiamo appena eliminato una voce attiva,
+     * rimuoviamo la voce PERSISTENTE usando gli ultimi parametri noti. */
+    if (!removed_persistent) {
+        char gw[NET_IP_MAX];
+        unsigned long ifidx = 0;
+        if (cfg_last_known(a->cfg, ip, gw, sizeof(gw), &ifidx))
+            route_delete(ip, gw, ifidx, eb, sizeof(eb));
+        else
+            dbg("[GUI] %s/32: nessun parametro noto per delete esatta", ip);
     }
 }
 

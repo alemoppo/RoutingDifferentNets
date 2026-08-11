@@ -5,7 +5,8 @@
  *
  *   {
  *     "routes": [
- *       { "ip": "37.244.28.101", "interface": "Ethernet 2", "guid": "{...}" }
+ *       { "ip": "37.244.28.101", "interface": "Ethernet 2", "guid": "{...}",
+ *         "last_gateway": "192.168.42.129", "last_ifindex": 11 }
  *     ]
  *   }
  */
@@ -64,10 +65,60 @@ static BOOL js_field(const char *beg, const char *end, const char *key,
 
 static const char *obj_close(const char *beg, const char *end)
 {
-    for (const char *p = beg; p < end; p++)
-        if (*p == '}')
+    /* `beg` e' il primo carattere DOPO una '{': profondita' iniziale 1.
+     * Le stringhe vengono saltate: le '{'/'}' dentro un valore stringa
+     * (es. un GUID "{...}") NON contribuiscono al bilanciamento. */
+    int depth = 1;
+    for (const char *p = beg; p < end; p++) {
+        if (*p == '"') {
+            for (p++; p < end; p++) {
+                if (*p == '\\') {
+                    p++;
+                } else if (*p == '"') {
+                    break;
+                }
+            }
+        } else if (*p == '{') {
+            depth++;
+        } else if (*p == '}' && --depth == 0) {
             return p;
+        }
+    }
     return NULL;
+}
+
+/* Cerca la chiave `key` e parsa un intero decimale non negativo. */
+static BOOL js_field_num(const char *beg, const char *end, const char *key,
+                         unsigned long *out)
+{
+    char pat[64];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *q = beg;
+    while (q < end) {
+        const char *p = strstr(q, pat);
+        if (!p || p + strlen(pat) >= end)
+            return FALSE;
+        const char *c = p + strlen(pat);
+        while (c < end && (*c == ' ' || *c == '\t' || *c == '\n' || *c == '\r'))
+            c++;
+        if (c >= end || *c != ':')
+            return FALSE;
+        c++;
+        while (c < end && (*c == ' ' || *c == '\t' || *c == '\n' || *c == '\r'))
+            c++;
+        unsigned long v = 0;
+        int digits = 0;
+        while (c < end && *c >= '0' && *c <= '9') {
+            v = v * 10 + (unsigned long)(*c - '0');
+            c++;
+            digits++;
+        }
+        if (digits == 0)
+            return FALSE;
+        *out = v;
+        return TRUE;
+    }
+    return FALSE;
 }
 
 void cfg_load(Config *c, const char *path)
@@ -99,26 +150,42 @@ void cfg_load(Config *c, const char *path)
 
     const char *pos = buf;
     const char *end = buf + rd;
-    while (pos < end) {
-        const char *open = strchr(pos, '{');
-        if (!open)
-            break;
-        const char *close = obj_close(open + 1, end);
-        if (!close)
-            break;
 
-        char ip[NET_IP_MAX], name[NET_NAME_MAX], guid[NET_GUID_MAX];
-        ip[0] = name[0] = guid[0] = '\0';
-        BOOL has_ip = js_field(open + 1, close, "ip", ip, sizeof(ip));
-        js_field(open + 1, close, "interface", name, sizeof(name));
-        js_field(open + 1, close, "guid", guid, sizeof(guid));
+    /* Trova l'oggetto radice (bilanciato: la GUID annidata non lo spezza),
+     * poi scandisce i singoli oggetti-voce contenuti. */
+    const char *root_open = strchr(pos, '{');
+    const char *root_close = root_open ? obj_close(root_open + 1, end) : NULL;
+    if (root_open && root_close) {
+        const char *item = root_open + 1;
+        while (item < root_close) {
+            const char *open = strchr(item, '{');
+            if (!open || open >= root_close)
+                break;
+            const char *close = obj_close(open + 1, root_close);
+            if (!close)
+                break;
 
-        /* Solo destinazioni IPv4 valide: una voce corrotta non viene
-         * importata e non puo' compromettere il resto del file. */
-        if (has_ip && ip[0] && net_valid_ipv4(ip))
-            cfg_add(c, ip, name, guid);
+            char ip[NET_IP_MAX], name[NET_NAME_MAX], guid[NET_GUID_MAX];
+            char gw[NET_IP_MAX];
+            unsigned long ifidx = 0;
+            ip[0] = name[0] = guid[0] = gw[0] = '\0';
+            BOOL has_ip = js_field(open + 1, close, "ip", ip, sizeof(ip));
+            js_field(open + 1, close, "interface", name, sizeof(name));
+            js_field(open + 1, close, "guid", guid, sizeof(guid));
+            js_field(open + 1, close, "last_gateway", gw, sizeof(gw));
+            js_field_num(open + 1, close, "last_ifindex", &ifidx);
 
-        pos = close + 1;
+            /* Only destinazioni IPv4 valide. `last_*` sono opzionali e
+             * servono solo a una cancellazione esatta quando l'interfaccia
+             * e' assente; accettati solo se coerenti. */
+            if (has_ip && ip[0] && net_valid_ipv4(ip)) {
+                cfg_add(c, ip, name, guid);
+                if (gw[0] && net_valid_ipv4(gw) && ifidx != 0)
+                    cfg_set_last(c, ip, gw, ifidx);
+            }
+
+            item = close + 1;
+        }
     }
 
     free(buf);
@@ -129,44 +196,59 @@ BOOL cfg_save(const Config *c)
     if (!c->path[0])
         return FALSE;
 
-    /* Crea la directory se assente. */
+    /* Crea la directory se assente (solo se il path contiene una cartella). */
     char dir[MAX_PATH];
     snprintf(dir, sizeof(dir), "%s", c->path);
     char *slash = strrchr(dir, '\\');
-    if (slash)
+    if (slash) {
         *slash = '\0';
-    if (dir[0]) {
-        CreateDirectoryA(dir, NULL);
-        /* Directory annidate: crea ogni componente mancante. */
-        for (char *p = dir + 1; *p; p++)
-            if (*p == '\\') {
-                *p = '\0';
-                CreateDirectoryA(dir, NULL);
-                *p = '\\';
-            }
-        /* 'N:' -> directory mendante; ok */
-        CreateDirectoryA(dir, NULL);
+        if (dir[0]) {
+            CreateDirectoryA(dir, NULL);
+            /* Directory annidate: crea ogni componente mancante. */
+            for (char *p = dir + 1; *p; p++)
+                if (*p == '\\') {
+                    *p = '\0';
+                    CreateDirectoryA(dir, NULL);
+                    *p = '\\';
+                }
+            /* 'N:' -> directory mendante; ok */
+            CreateDirectoryA(dir, NULL);
+        }
     }
 
     /* Serializza in un buffer in memoria (mai direttamente sul file). */
-    size_t cap = 128 + (size_t)c->count *
-                        (NET_IP_MAX + NET_NAME_MAX + NET_GUID_MAX + 64);
+    size_t cap = 256 + (size_t)c->count *
+                        (NET_IP_MAX * 2 + NET_NAME_MAX + NET_GUID_MAX + 80);
     char *buf = (char *)malloc(cap);
     if (!buf)
         return FALSE;
 
     size_t p = 0;
-    p += (size_t)snprintf(buf + p, cap - p, "{\n  \"routes\": [\n");
-    for (int i = 0; i < c->count && p < cap; i++) {
+    int r = snprintf(buf + p, cap - p, "{\n  \"routes\": [\n");
+    if (r < 0 || (size_t)r >= cap - p) { free(buf); return FALSE; }
+    p += (size_t)r;
+
+    for (int i = 0; i < c->count; i++) {
         const RouteConfigItem *it = &c->items[i];
-        p += (size_t)snprintf(buf + p, cap - p,
-             "    { \"ip\": \"%s\", \"interface\": \"%s\", \"guid\": \"%s\" }%s\n",
-             it->ip, it->name, it->guid,
-             (i + 1 < c->count) ? "," : "");
+        if (it->last_gateway[0] && it->last_ifindex != 0)
+            r = snprintf(buf + p, cap - p,
+                 "    { \"ip\": \"%s\", \"interface\": \"%s\", \"guid\": \"%s\","
+                 " \"last_gateway\": \"%s\", \"last_ifindex\": %lu }%s\n",
+                 it->ip, it->name, it->guid, it->last_gateway,
+                 it->last_ifindex, (i + 1 < c->count) ? "," : "");
+        else
+            r = snprintf(buf + p, cap - p,
+                 "    { \"ip\": \"%s\", \"interface\": \"%s\", \"guid\": \"%s\" }%s\n",
+                 it->ip, it->name, it->guid,
+                 (i + 1 < c->count) ? "," : "");
+        if (r < 0 || (size_t)r >= cap - p) { free(buf); return FALSE; }
+        p += (size_t)r;
     }
-    if (p < cap)
-        snprintf(buf + p, cap - p, "  ]\n}\n");
-    size_t len = strlen(buf);
+
+    r = snprintf(buf + p, cap - p, "  ]\n}\n");
+    if (r < 0 || (size_t)r >= cap - p) { free(buf); return FALSE; }
+    p += (size_t)r;
+    size_t len = p;
 
     /* Scrittura atomica: config.json.tmp -> flush -> MoveFileExW.
      * Se un qualsiasi passo fallisce il vecchio config.json resta intatto. */
@@ -231,6 +313,30 @@ void cfg_remove(Config *c, const char *ip)
     for (int j = i; j + 1 < c->count; j++)
         c->items[j] = c->items[j + 1];
     c->count--;
+}
+
+void cfg_set_last(Config *c, const char *ip, const char *gateway,
+                  unsigned long ifindex)
+{
+    int i = cfg_find(c, ip);
+    if (i < 0)
+        return;
+    snprintf(c->items[i].last_gateway, sizeof(c->items[i].last_gateway), "%s",
+             gateway ? gateway : "");
+    c->items[i].last_ifindex = ifindex;
+}
+
+BOOL cfg_last_known(const Config *c, const char *ip, char *gateway, size_t n,
+                    unsigned long *ifindex)
+{
+    int i = cfg_find(c, ip);
+    if (i < 0)
+        return FALSE;
+    if (!c->items[i].last_gateway[0] || c->items[i].last_ifindex == 0)
+        return FALSE;
+    snprintf(gateway, n, "%s", c->items[i].last_gateway);
+    *ifindex = c->items[i].last_ifindex;
+    return TRUE;
 }
 
 int cfg_find(const Config *c, const char *ip)

@@ -181,8 +181,15 @@ backend_test.exe config <f>  -> show rules saved in <f>
 - Persistence across reboots relies on `route.exe -p` launched asynchronously:
   if the app is closed the same instant a route is added, the persistent entry
   may be lost (the active route itself is created natively and remains until
-  reboot).
+  reboot). Asynchronous operations on the same destination IP are serialized to
+  avoid a `route.exe add` racing a `route.exe delete`.
 - When a rule is removed while its interface is completely absent from the
-  system, the persistent entry is removed with `route.exe delete` for that
-  destination; in this edge case a foreign persistent `/32` route to the same
-  IP would also be removed.
+  system, the persistent entry is removed using the last-known gateway/ifIndex
+  saved in `config.json` (`last_gateway`/`last_ifindex`), so only the exact
+  managed entry is targeted. If no such parameters are known, the app refuses
+  the delete rather than risk touching a third-party persistent route.
+- Route metric: the app sets `route metric 1` (minimum). Windows selects the
+  winning route by summing the *interface* metric and the *route* metric, so
+  the /32 entry is preferred but a VPN route toward the same IP with a lower
+  combined metric can still win; this is a Windows routing-stack decision and
+  cannot be overridden from user mode.

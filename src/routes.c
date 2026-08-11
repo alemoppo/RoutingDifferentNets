@@ -104,13 +104,66 @@ BOOL net_valid_ipv4(const char *s)
     return InetPtonA(AF_INET, s, &a) == 1;
 }
 
-/* ------------------------------------------------------------ route.exe (async) */
+/* ------------------------------------------------------------ route.exe (async)
+ * route.exe viene lanciato in modo ASINCRONO per non bloccare la GUI, ma per
+ * lo STESSO destination IP le operazioni vengono serializzate: prima di
+ * lanciare un comando attendiamo il completamento di un eventuale comando
+ * precedente ancora in volo (route.exe termina in pochi ms, quindi l'attesa
+ * e' trascurabile). Questo evita la race "add persistente" vs "delete
+ * persistente" dove l'ordine di completamento non sarebbe garantito. */
 
-/* Lancia route.exe con la command line data, SENZA attendere il termine:
- * la route attiva viene creata/rimossa con le API native; route.exe serve
- * solo alla persistenza tra riavvii e non deve mai bloccare la GUI. */
-static void run_route_cli_async(const wchar_t *cmdline)
+#define MAX_PENDING_CLI 32
+typedef struct {
+    char   ip[NET_IP_MAX];
+    HANDLE h;
+} PendingCli;
+
+static PendingCli g_pending[MAX_PENDING_CLI];
+static int g_npending = 0;
+
+/* Raccoglie i processi gia' terminati e compatta la lista. */
+static void cli_reap(void)
 {
+    for (int i = g_npending - 1; i >= 0; i--) {
+        if (g_pending[i].h &&
+            WaitForSingleObject(g_pending[i].h, 0) == WAIT_OBJECT_0) {
+            CloseHandle(g_pending[i].h);
+            g_pending[i].h = NULL;
+        }
+    }
+    int w = 0;
+    for (int i = 0; i < g_npending; i++)
+        if (g_pending[i].h)
+            g_pending[w++] = g_pending[i];
+    g_npending = w;
+}
+
+/* Attende (con timeout di sicurezza) il completamento di ogni route.exe
+ * ancora in volo per lo stesso IP destinazione. */
+static void cli_wait_dest(const char *ip)
+{
+    for (int i = 0; i < g_npending; i++) {
+        if (g_pending[i].h && strcmp(g_pending[i].ip, ip) == 0) {
+            WaitForSingleObject(g_pending[i].h, 3000);
+            CloseHandle(g_pending[i].h);
+            g_pending[i].h = NULL;
+        }
+    }
+    int w = 0;
+    for (int i = 0; i < g_npending; i++)
+        if (g_pending[i].h)
+            g_pending[w++] = g_pending[i];
+    g_npending = w;
+}
+
+/* Lancia route.exe: prima serializza con eventuali operazioni in corso sullo
+ * stesso IP, poi parte senza bloccare la GUI. Il handle resta tracciato per
+ * evitare race con operazioni successive sullo stesso IP. */
+static void cli_run(const wchar_t *cmdline, const char *ip)
+{
+    cli_reap();
+    cli_wait_dest(ip);
+
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     memset(&si, 0, sizeof(si));
@@ -122,7 +175,15 @@ static void run_route_cli_async(const wchar_t *cmdline)
                         CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
         return;
     CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
+
+    if (g_npending < MAX_PENDING_CLI) {
+        snprintf(g_pending[g_npending].ip, sizeof(g_pending[g_npending].ip),
+                 "%s", ip);
+        g_pending[g_npending].h = pi.hProcess;
+        g_npending++;
+    } else {
+        CloseHandle(pi.hProcess);
+    }
 }
 
 /* route -p add: voce persistente che sopravvive al riavvio. */
@@ -133,21 +194,23 @@ static void route_cli_persistent_add(const char *ip, const char *gateway,
     swprintf(cmd, 512,
              L"route -p add %S mask 255.255.255.255 %S if %lu",
              ip, gateway, ifindex);
-    run_route_cli_async(cmd);
+    cli_run(cmd, ip);
 }
 
-/* route delete con gateway: rimuove la voce persistente che corrisponde
- * a destination+mask+gateway, lasciando intatte eventuali route persistenti
- * di terze parti verso lo stesso IP ma con gateway diverso. */
-static void route_cli_delete(const char *ip, const char *gateway)
+/* route delete SPECIFICO: destination + mask + gateway [+ if]. Mai senza
+ * gateway: una cancellazione alla cieca potrebbe rimuovere la voce
+ * persistente di terze parti verso lo stesso IP. */
+static void route_cli_delete(const char *ip, const char *gateway,
+                             unsigned long ifindex)
 {
     wchar_t cmd[512];
-    if (gateway && gateway[0])
+    if (ifindex != 0)
+        swprintf(cmd, 512, L"route delete %S mask 255.255.255.255 %S if %lu",
+                 ip, gateway, ifindex);
+    else
         swprintf(cmd, 512, L"route delete %S mask 255.255.255.255 %S",
                  ip, gateway);
-    else
-        swprintf(cmd, 512, L"route delete %S mask 255.255.255.255", ip);
-    run_route_cli_async(cmd);
+    cli_run(cmd, ip);
 }
 
 /* ------------------------------------------------------ API native (netio) */
@@ -280,16 +343,19 @@ BOOL route_delete(const char *ip, const char *gateway, unsigned long ifindex,
         return FALSE;
     }
 
-    if (gateway && gateway[0] && ifindex != 0) {
-        /* Rimozione precisa della sola route gestita (attiva + persistente). */
-        route_nio_delete_exact(ip, 32, ifindex, gateway);
-        route_cli_delete(ip, gateway);
-        dbg("[ROUTE] %s/32 eliminata (if %lu gw %s)", ip, ifindex, gateway);
-    } else {
-        /* ifIndex/gateway non noti (interfaccia assente): si rimuove solo la
-         * voce persistente, senza cancellare route attive di terze parti. */
-        route_cli_delete(ip, NULL);
-        dbg("[ROUTE] %s/32: voce persistente rimossa (gw ignoto)", ip);
+    /* Cancellazione ESATTA (attiva + persistente) SOLO se conosciamo i
+     * parametri con cui la route fu creata. Senza gateway/ifIndex una
+     * rimozione alla cieca potrebbe colpire una route di terze parti verso
+     * lo stesso IP (es. VPN): quindi rifiutiamo. */
+    if (!gateway || !gateway[0] || ifindex == 0) {
+        if (err)
+            snprintf(err, errsz, "parametri di cancellazione non noti");
+        dbg("[ROUTE] %s/32: cancellazione rifiutata (gw/if ignoti)", ip);
+        return FALSE;
     }
+
+    route_nio_delete_exact(ip, 32, ifindex, gateway);
+    route_cli_delete(ip, gateway, ifindex);
+    dbg("[ROUTE] %s/32 eliminata (if %lu gw %s)", ip, ifindex, gateway);
     return TRUE;
 }
