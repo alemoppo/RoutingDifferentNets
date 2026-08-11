@@ -168,18 +168,41 @@ void monitor_stop(NetMon *m)
     if (!m)
         return;
 
+    /* Catturiamo PRIMA tutti gli handle di cui abbiamo bisogno: dopo la
+     * segnalazione il thread puo' liberare `m` in parallelo, quindi non
+     * dobbiamo MAI rileggere la struttura. */
     HANDLE ht = m->hThread;
     HANDLE he = m->hExit;
 
-    m->halt = 1;
+    /* Segnala l'evento (per svegliare il wait del thread, che vede hExit nel
+     * vettore di WaitForMultipleObjects) e imposta il flag `halt`, che e' la
+     * via di uscita AUTORITATIVA e affidabile del loop (ricontrollato a ogni
+     * risveglio bounded, mai INFINITE). Segnaliamo PRIMA di scrivere halt
+     * cosi' il SetEvent non puo' mai finire su un handle gia' chiuso dal
+     * thread. */
     SetEvent(he);
+    m->halt = 1;
 
-    /* Da qui in avanti si usano SOLO le copie locali ht/he: `m` puo' essere
-     * liberato dal thread in parallelo. Il wait (reap) serve a bloccare la
-     * GUI finche' il thread non ha fatto l'ultimo SDL_PushEvent, prima della
-     * teardown SDL. */
+    /* Reap bounded (5000 ms, teardown/shutdown only). Il thread, avendo visto
+     * `halt`, esce entro il suo wait bounded massimo (~2s) e da SOLO esegue
+     * cancel_all + CloseHandle(hExit) + free(m). Questo wait serve a non
+     * procedere con la teardown SDL mentre il thread sta facendo il suo
+     * ultimo SDL_PushEvent. Da qui in avanti usiamo SOLO la copia locale `ht`:
+     * mai piu' `m`.
+     *
+     * Caso SUCCESSO: il thread e' terminato e ha gia' liberato `m` e chiuso
+     * hExit; qui chiudiamo solo la NOSTRA referenza su hThread. Nessun
+     * double-free (il thread non chiude hThread) e nessun double-close su
+     * hExit (lo chiude solo il thread).
+     *
+     * Caso TIMEOUT (eccezionale): non facciamo NIENTE di distruttivo. Non
+     * liberiamo `m` (niente free prematuro/UAF) e chiudiamo solo la nostra
+     * referenza su hThread: la struttura resta di proprieta' del thread, che
+     * al suo prossimo risveglio bounded completa comunque il cleanup. Se il
+     * wake non arrivasse proprio (condizione patologica), `m` vivrebbe fino
+     * alla terminazione del processo: accettabile perche' questo e' shutdown. */
     if (ht)
-        WaitForSingleObject(ht, 3000);
+        WaitForSingleObject(ht, 5000);
     if (ht)
         CloseHandle(ht);
 }
