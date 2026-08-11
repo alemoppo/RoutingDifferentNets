@@ -886,7 +886,7 @@ static void draw_dialog(App *a)
 
 /* ====================================================== azioni dialogo */
 
-static void delete_owned_routes(App *a, const char *ip, const char *guid);
+static BOOL delete_owned_routes(App *a, const char *ip, const char *guid);
 
 static void dialog_open(App *a, int edit_idx)
 {
@@ -1094,12 +1094,13 @@ static BOOL route_is_ours(const App *a, const HostRoute *hr,
            _stricmp(hr->gateway, it->last_gateway) == 0;
 }
 
-static void delete_owned_routes(App *a, const char *ip, const char *guid)
+static BOOL delete_owned_routes(App *a, const char *ip, const char *guid)
 {
     (void)guid;   /* la proprieta' e' decisa da route_is_ours */
     routes_snapshot(&a->routes);
     char eb[128];
     int removed_persistent = 0;
+    BOOL ok = TRUE;
     for (int k = 0; k < a->routes.count; k++) {
         const HostRoute *hr = &a->routes.items[k];
         if (hr->prefix_len != 32 || strcmp(hr->ip, ip) != 0)
@@ -1110,7 +1111,7 @@ static void delete_owned_routes(App *a, const char *ip, const char *guid)
         const RouteConfigItem *it = &a->cfg->items[idx];
         if (!route_is_ours(a, hr, it))
             continue;
-        route_delete(ip, hr->gateway, hr->ifindex, eb, sizeof(eb));
+        ok &= route_delete(ip, hr->gateway, hr->ifindex, eb, sizeof(eb));
         removed_persistent = 1;
     }
     /* Interfaccia assente: se non abbiamo appena eliminato una voce attiva,
@@ -1119,10 +1120,11 @@ static void delete_owned_routes(App *a, const char *ip, const char *guid)
         char gw[NET_IP_MAX];
         unsigned long ifidx = 0;
         if (cfg_last_known(a->cfg, ip, gw, sizeof(gw), &ifidx))
-            route_delete(ip, gw, ifidx, eb, sizeof(eb));
+            ok &= route_delete(ip, gw, ifidx, eb, sizeof(eb));
         else
             dbg("[GUI] %s/32: nessun parametro noto per delete esatta", ip);
     }
+    return ok;
 }
 
 static void cmd_do(App *a, CmdId cmd, int idx)
@@ -1148,14 +1150,18 @@ static void cmd_do(App *a, CmdId cmd, int idx)
             char eb[128];
             BOOL online = ni && ni->state == NET_CONNECTED &&
                           ni->gateway[0] && ni->ifindex != 0;
+            BOOL del_ok;
             if (online)
-                route_delete(ip, ni->gateway, ni->ifindex, eb, sizeof(eb));
+                del_ok = route_delete(ip, ni->gateway, ni->ifindex, eb,
+                                      sizeof(eb));
             else
-                delete_owned_routes(a, ip, it->guid);
+                del_ok = delete_owned_routes(a, ip, it->guid);
             cfg_remove(a->cfg, ip);
             if (cfg_save(a->cfg)) {
                 snprintf(a->opmsg, sizeof(a->opmsg),
-                         "Regola %s rimossa, route eliminata.", ip);
+                         del_ok ? "Regola %s rimossa, route eliminata."
+                                : "Regola %s rimossa, MA route non eliminata: %s",
+                         ip, del_ok ? "" : eb[0] ? eb : "errore");
             } else {
                 snprintf(a->opmsg, sizeof(a->opmsg),
                          "ERRORE: salvataggio configurazione fallito.");

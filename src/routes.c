@@ -191,6 +191,37 @@ static void cli_run(const wchar_t *cmdline, const char *ip)
     }
 }
 
+/* Variante SINCRONA di route.exe: attende il completamento (route.exe termina
+ * in pochi ms) e ritorna l'exit code, oppure 0xFFFFFFFF se il processo non e'
+ * stato nemmeno lanciato. Usata solo per le cancellazioni, dove serve
+ * conoscere l'esito reale di route.exe per propagarlo al chiamante. */
+#define CLI_EXIT_SPAWN_FAIL 0xFFFFFFFFu
+static DWORD cli_run_sync(const wchar_t *cmdline, const char *ip)
+{
+    cli_reap();
+    cli_wait_dest(ip);
+
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof(si));
+    memset(&pi, 0, sizeof(pi));
+    si.cb = sizeof(si);
+
+    if (!CreateProcessW(NULL, (LPWSTR)cmdline, NULL, NULL, FALSE,
+                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        dbg("[ROUTE] CreateProcessW FALLITO (%lu): %S", GetLastError(), cmdline);
+        return CLI_EXIT_SPAWN_FAIL;
+    }
+    CloseHandle(pi.hThread);
+
+    DWORD rc = CLI_EXIT_SPAWN_FAIL;
+    if (WaitForSingleObject(pi.hProcess, 3000) == WAIT_OBJECT_0)
+        GetExitCodeProcess(pi.hProcess, &rc);
+    CloseHandle(pi.hProcess);
+    dbg("[ROUTE] route.exe sincrono exit=%lu (%s)", rc, ip);
+    return rc;
+}
+
 /* route -p add: voce persistente che sopravvive al riavvio. */
 static void route_cli_persistent_add(const char *ip, const char *gateway,
                                      unsigned long ifindex)
@@ -204,8 +235,10 @@ static void route_cli_persistent_add(const char *ip, const char *gateway,
 
 /* route delete SPECIFICO: destination + mask + gateway [+ if]. Mai senza
  * gateway: una cancellazione alla cieca potrebbe rimuovere la voce
- * persistente di terze parti verso lo stesso IP. */
-static void route_cli_delete(const char *ip, const char *gateway,
+ * persistente di terze parti verso lo stesso IP. Eseguito in modo SINCRONO
+ * perche' dobbiamo conoscere l'esito reale di route.exe e propagarlo.
+ * Ritorna TRUE se route.exe e' partito e ha concluso con exit code 0. */
+static BOOL route_cli_delete(const char *ip, const char *gateway,
                              unsigned long ifindex)
 {
     wchar_t cmd[512];
@@ -215,7 +248,8 @@ static void route_cli_delete(const char *ip, const char *gateway,
     else
         swprintf(cmd, 512, L"route delete %hs mask 255.255.255.255 %hs",
                  ip, gateway);
-    cli_run(cmd, ip);
+    DWORD rc = cli_run_sync(cmd, ip);
+    return rc != CLI_EXIT_SPAWN_FAIL && rc == 0;
 }
 
 /* ------------------------------------------------------ API native (netio) */
@@ -236,7 +270,10 @@ static BOOL route_nio_add(const char *ip, const char *gateway,
 
     row.InterfaceLuid.Value = 0;
     row.InterfaceIndex      = ifindex;
-    /* Metrica minima: tra piu' route /32 verso lo stesso IP vince la nostra. */
+    /* Metrica route minima (1): Windows seleziona la route vincente sommando
+     * metrica interfaccia + metrica route, quindi la /32 e' preferita ma una
+     * route VPN verso lo stesso IP con metrica combinata inferiore puo'
+     * comunque prevalere (decisione dello stack di routing). */
     row.Metric              = 1;
 
     row.NextHop.si_family = AF_INET;
@@ -305,11 +342,16 @@ BOOL route_add_persistent(const char *ip, const char *gateway,
         return FALSE;
     }
 
-    /* 1) Route gia' esattamente corretta: nessuna operazione. */
+    /* 1) Se la route attiva e' gia' esattamente corretta, non serve ricrearla,
+     *    ma la PERSISTENZA va comunque garantita: la ri-iscriviamo via
+     *    route.exe -p, operazione idempotente che non crea duplicati. Se la
+     *    route attiva NON e' presente, si procede al punto 2 (creazione
+     *    nativa). */
     RouteList snap;
     if (routes_snapshot(&snap) &&
         routes_find_host_exact(&snap, ip, 32, ifindex, gateway)) {
-        dbg("[ROUTE] %s/32 OK (gia' presente)", ip);
+        dbg("[ROUTE] %s/32 OK (gia' presente) - assicuro persistenza", ip);
+        route_cli_persistent_add(ip, gateway, ifindex);
         return TRUE;
     }
 
@@ -359,8 +401,24 @@ BOOL route_delete(const char *ip, const char *gateway, unsigned long ifindex,
         return FALSE;
     }
 
-    route_nio_delete_exact(ip, 32, ifindex, gateway);
-    route_cli_delete(ip, gateway, ifindex);
+    /* 1) Rimozione della route ATTIVA (API nativa). */
+    BOOL nio_ok = route_nio_delete_exact(ip, 32, ifindex, gateway);
+
+    /* 2) Rimozione della voce PERSISTENTE (route.exe). */
+    BOOL cli_ok = route_cli_delete(ip, gateway, ifindex);
+
+    if (!nio_ok || !cli_ok) {
+        if (err) {
+            snprintf(err, errsz,
+                     "errore rimozione %s/32 (nio:%s cli:%s)", ip,
+                     nio_ok ? "ok" : "FAIL",
+                     cli_ok ? "ok" : "FAIL");
+        }
+        dbg("[ROUTE] %s/32 ERRORE in rimozione (nio:%d cli:%d)",
+            ip, nio_ok, cli_ok);
+        return FALSE;
+    }
+
     dbg("[ROUTE] %s/32 eliminata (if %lu gw %s)", ip, ifindex, gateway);
     return TRUE;
 }
