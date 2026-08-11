@@ -71,6 +71,7 @@ typedef struct {
     char          actual_if[CONFIG_MAX_ROUTES][NET_NAME_MAX];
     char          reason[CONFIG_MAX_ROUTES][NET_NAME_MAX];
     char          summary[768];
+    BOOL          persist_pend[CONFIG_MAX_ROUTES]; /* persistenza da ritentare */
 
     Hit           hits[MAX_HITS];
     int           nhits;
@@ -412,6 +413,13 @@ static void reconcile(App *a, int force)
             a->st[j] = ROUTE_STATUS_OK; nok++;
             cfg_changed |= cfg_set_last(a->cfg, it->ip, ni->gateway,
                                         ni->ifindex);
+            /* La persistenza che non era riuscita a essere accodata (coda
+             * piena) viene qui RITENTATA finche' non passa: un blocco
+             * momentaneo della coda CLI non deve MAI perdere la
+             * sopravvivenza al riavvio della route. */
+            if (a->persist_pend[j] &&
+                route_ensure_persistent(it->ip, ni->gateway, ni->ifindex))
+                a->persist_pend[j] = FALSE;
             dbg("[ROUTE] %s/32 OK (if %lu gw %s)", it->ip, ni->ifindex,
                 ni->gateway);
             continue;
@@ -437,7 +445,7 @@ static void reconcile(App *a, int force)
 
         /* Ricrea con i parametri correnti dell'interfaccia. */
         if (route_add_persistent(it->ip, ni->gateway, ni->ifindex,
-                                 eb, sizeof(eb))) {
+                                 &a->persist_pend[j], eb, sizeof(eb))) {
             routes_snapshot(&a->routes);
             if (routes_find_host_exact(&a->routes, it->ip, 32, ni->ifindex,
                                        ni->gateway)) {

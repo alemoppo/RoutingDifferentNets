@@ -120,7 +120,14 @@ static DWORD WINAPI monitor_thread(LPVOID p)
         retry = !register_all(m);
     }
 
+    /* Il thread e' l'UNICO proprietario di `m`: dopo aver visto `halt`
+     * cancella le notifiche, chiude l'evento e libera la struttura prima di
+     * restituire. monitor_stop() pertanto non deve MAI toccare `m` dopo
+     * averlo segnalato (nessun free concorrente / doppio free). */
     cancel_all(m);
+    if (m->hExit)
+        CloseHandle(m->hExit);
+    free(m);
     return 0;
 }
 
@@ -147,35 +154,32 @@ NetMon *monitor_start(net_change_cb cb, void *user)
     return m;
 }
 
+/* La gestione della struttura e' stata ceduta al thread monitor: monitor_stop()
+ * raccoglie TUTTO cio' di cui ha bisogno (i due HANDLE) PRIMA di fronte alla
+ * segnalazione, cosi' da non dover mai rileggere (e quindi usare-after-free)
+ * `m` nel momento in cui il thread, avendo visto `halt`, sta liberando la
+ * struttura. Il wait e' bounded ed e' accettabile perche' questa funzione e'
+ * usata SOLO in teardown/shutdown definitivo dell'app (fine di gui_run): il
+ * normale ciclo GUI non vi passa mai. In caso di timeout non liberiamo nulla:
+ * il thread, al suo prossimo risveglio (wait bounded <= 2s) uscira', e da solo
+ * cancel_all() + chiude hExit + free(m): quindi nessun leak e nessun UAF. */
 void monitor_stop(NetMon *m)
 {
     if (!m)
         return;
 
-    /* Imposta il flag esplicito e segnala l'evento, poi attende che il thread
-     * sia DAVVERO terminato prima di toccare la struttura. Grazie al flag
-     * `halt` + wait bounded nel loop, il thread esce entro ~1s. Per non
-     * bloccare mai la GUI (il wait qui gira sul thread grafico) usiamo un
-     * timeout limite: se (caso mai) il thread non fosse uscito, NON lo
-     * liberiamo (evita use-after-free) e procediamo: il processo, in uscita,
-     * terminera' comunque il thread rimasto appeso. */
+    HANDLE ht = m->hThread;
+    HANDLE he = m->hExit;
+
     m->halt = 1;
-    SetEvent(m->hExit);
-    if (m->hThread) {
-        if (WaitForSingleObject(m->hThread, 5000) == WAIT_TIMEOUT)
-            dbg("[MON] stop: thread monitor non terminato in 5s (esito fallback)");
-        else {
-            CloseHandle(m->hThread);
-            m->hThread = NULL;
-        }
-    }
-    if (!m->hThread) {
-        cancel_all(m);
-        if (m->hExit)
-            CloseHandle(m->hExit);
-        free(m);
-    }
-    /* se m->hThread e' rimasto valido, significa che il thread non e' uscito:
-     * lasciamo `m` vivo (non liberato) per sicurezza; verra' reclamato
-     * all'uscita del processo. */
+    SetEvent(he);
+
+    /* Da qui in avanti si usano SOLO le copie locali ht/he: `m` puo' essere
+     * liberato dal thread in parallelo. Il wait (reap) serve a bloccare la
+     * GUI finche' il thread non ha fatto l'ultimo SDL_PushEvent, prima della
+     * teardown SDL. */
+    if (ht)
+        WaitForSingleObject(ht, 3000);
+    if (ht)
+        CloseHandle(ht);
 }

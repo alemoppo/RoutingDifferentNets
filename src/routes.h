@@ -60,7 +60,16 @@ BOOL net_valid_ipv4(const char *s);
  * Se esiste gia' una route diversa verso lo stesso IP (es. VPN) non viene
  * toccata: le route possono coesistere e la /32 con metrica bassa prevale. */
 BOOL route_add_persistent(const char *ip, const char *gateway,
-                          unsigned long ifindex, char *err, size_t errsz);
+                          unsigned long ifindex, int *pended,
+                          char *err, size_t errsz);
+
+/* Riconferma la persistenza (route.exe -p add, idempotente) per una route in
+ * stato OK, senza creare duplicati. Ritorna TRUE se l'operazione e' stata
+ * ACCODATA in coda (FALSE = coda piena, in tal caso il chiamante dovra'
+ * ritentarla al prossimo reconcile). Usata dal flag `pended` di reconcile
+ * per non perdere la persistenza quando la coda CLI era piena. */
+BOOL route_ensure_persistent(const char *ip, const char *gateway,
+                             unsigned long ifindex);
 
 /* Rimuove SOLO la route gestita, con corrispondenza esatta
  * destination+prefix+ifIndex+gateway (attiva e persistente).

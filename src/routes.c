@@ -288,10 +288,11 @@ static BOOL cli_enqueue(const char *ip, const char *gw, unsigned long ifindex,
 /* route -p add: voce persistente che sopravvive al riavvio (asincrono).
  * Ritorna TRUE se l'operazione e' stata ACCODATA per l'esecuzione (potrebbe
  * essere ancora pending), FALSE solo se la coda era piena: in tal caso la
- * persistenza NON e' programmata e verra' ritentata da un successivo
- * reconcile (che ri-accoda la persistenza per ogni route in stato OK). */
-static BOOL route_cli_persistent_add(const char *ip, const char *gateway,
-                                     unsigned long ifindex)
+ * persistenza NON e' programmata. reconcile() la ritenta al successivo
+ * passaggio tramite il flag `pended` (vedi route_add_persistent), cosi' una
+ * pienezza momentanea della coda CLI non fa MAI perdere la persistenza. */
+BOOL route_ensure_persistent(const char *ip, const char *gateway,
+                             unsigned long ifindex)
 {
     return cli_enqueue(ip, gateway, ifindex, CLI_ADD);
 }
@@ -406,9 +407,11 @@ void routes_cli_poll(void)
 /* ---------------------------------------------------------------- API pub */
 
 BOOL route_add_persistent(const char *ip, const char *gateway,
-                          unsigned long ifindex, char *err, size_t errsz)
+                          unsigned long ifindex, int *pended,
+                          char *err, size_t errsz)
 {
     if (err) err[0] = '\0';
+    if (pended) *pended = 0;
     if (!net_valid_ipv4(ip) || !net_valid_ipv4(gateway) || ifindex == 0) {
         if (err) snprintf(err, errsz, "parametri route non validi");
         return FALSE;
@@ -423,9 +426,11 @@ BOOL route_add_persistent(const char *ip, const char *gateway,
     if (routes_snapshot(&snap) &&
         routes_find_host_exact(&snap, ip, 32, ifindex, gateway)) {
         dbg("[ROUTE] %s/32 OK (gia' presente) - assicuro persistenza", ip);
-        if (!route_cli_persistent_add(ip, gateway, ifindex))
+        if (!route_ensure_persistent(ip, gateway, ifindex)) {
+            if (pended) *pended = 1;
             dbg("[ROUTE] %s/32: enqueue persistenza fallita (coda piena), "
                 "ritentata al prossimo reconcile", ip);
+        }
         return TRUE;
     }
 
@@ -446,9 +451,11 @@ BOOL route_add_persistent(const char *ip, const char *gateway,
      * creata: viene solo loggato e la persistenza e' ritentata da un
      * successivo reconcile. */
     if (ok) {
-        if (!route_cli_persistent_add(ip, gateway, ifindex))
+        if (!route_ensure_persistent(ip, gateway, ifindex)) {
+            if (pended) *pended = 1;
             dbg("[ROUTE] %s/32: enqueue persistenza fallita (coda piena), "
                 "sara' ritentato da reconcile", ip);
+        }
     }
 
     if (ok) {
