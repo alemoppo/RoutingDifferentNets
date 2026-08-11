@@ -315,15 +315,19 @@ void cfg_remove(Config *c, const char *ip)
     c->count--;
 }
 
-void cfg_set_last(Config *c, const char *ip, const char *gateway,
+BOOL cfg_set_last(Config *c, const char *ip, const char *gateway,
                   unsigned long ifindex)
 {
     int i = cfg_find(c, ip);
     if (i < 0)
-        return;
+        return FALSE;
+    if (c->items[i].last_ifindex == ifindex &&
+        strcmp(c->items[i].last_gateway, gateway ? gateway : "") == 0)
+        return FALSE;   /* invariato: nessun salvataggio necessario */
     snprintf(c->items[i].last_gateway, sizeof(c->items[i].last_gateway), "%s",
              gateway ? gateway : "");
     c->items[i].last_ifindex = ifindex;
+    return TRUE;
 }
 
 BOOL cfg_last_known(const Config *c, const char *ip, char *gateway, size_t n,

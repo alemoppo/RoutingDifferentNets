@@ -373,6 +373,7 @@ static void reconcile(App *a, int force)
         a->nets.items[i].has_default_route = (a->nets.items[i].ifindex == def);
 
     int nok = 0, nmiss = 0, nwrg = 0, noff = 0, nerr = 0;
+    int cfg_changed = 0;
 
     for (int j = 0; j < a->cfg->count; j++) {
         RouteConfigItem *it = &a->cfg->items[j];
@@ -405,7 +406,8 @@ static void reconcile(App *a, int force)
             snprintf(a->actual_if[j], sizeof(a->actual_if[j]), "%s",
                      ni->friendly_name);
             a->st[j] = ROUTE_STATUS_OK; nok++;
-            cfg_set_last(a->cfg, it->ip, ni->gateway, ni->ifindex);
+            cfg_changed |= cfg_set_last(a->cfg, it->ip, ni->gateway,
+                                        ni->ifindex);
             dbg("[ROUTE] %s/32 OK (if %lu gw %s)", it->ip, ni->ifindex,
                 ni->gateway);
             continue;
@@ -438,7 +440,8 @@ static void reconcile(App *a, int force)
                 snprintf(a->actual_if[j], sizeof(a->actual_if[j]), "%s",
                          ni->friendly_name);
                 a->st[j] = ROUTE_STATUS_OK; nok++;
-                cfg_set_last(a->cfg, it->ip, ni->gateway, ni->ifindex);
+                cfg_changed |= cfg_set_last(a->cfg, it->ip, ni->gateway,
+                                            ni->ifindex);
                 dbg("[ROUTE] %s/32 corretta -> %s (if %lu gw %s)",
                     it->ip, ni->friendly_name, ni->ifindex, ni->gateway);
             } else {
@@ -455,6 +458,12 @@ static void reconcile(App *a, int force)
             nerr++;
         }
     }
+
+    /* I parametri last_* cambiano quando la route e' confermata con nuovi
+     * gateway/ifIndex: salviamo subito, cosi' una successiva rimozione con
+     * interfaccia assente puo' sempre contare su una delete esatta. */
+    if (cfg_changed)
+        cfg_save(a->cfg);
 
     if (a->cfg->count == 0) {
         snprintf(a->summary, sizeof(a->summary),
@@ -592,6 +601,64 @@ static void draw_left(App *a)
 
     if (a->nets.count == 0)
         draw_text(a, x + 8, TOP, "Nessuna interfaccia trovata.", C_DIM, 2);
+
+    /* -------------------------------------------------- regole orfane
+     * Regole la cui interfaccia non e' presente (es. periferica scollegata).
+     * Senza questa sezione non sarebbe possibile rimuoverle: i pulsanti
+     * REMOVE/EDIT vivono solo dentro il blocco "Assigned IPs" di
+     * un'interfaccia attiva. */
+    int n_or = 0;
+    for (int j = 0; j < a->cfg->count; j++)
+        if (a->iface_of[j] == -1)
+            n_or++;
+    if (n_or > 0) {
+        int rh = 10 + LIN + n_or * (LIN + 1) + 10;
+        int cy = y;
+        if (cy + rh >= TOP - 2) {
+            fill_rect(a, x, cy, w, rh, C_PANEL2);
+            frame_rect(a, x, cy, w, rh, C_BORDER);
+            draw_text(a, x + 8, cy + 8, "Interfacce assenti:", C_AMBER, 2);
+            int y4 = cy + 8 + LIN;
+            int row_h = LIN - 1;
+            for (int j = 0; j < a->cfg->count && y4 < cy + rh; j++) {
+                if (a->iface_of[j] != -1) continue;
+                RouteConfigItem *it = &a->cfg->items[j];
+                Uint32 scol;
+                const char *sl;
+                status_style(a->st[j], &scol, &sl);
+
+                int bx_edit = x + w - 8 - 56;
+                int bx_rem  = x + w - 8 - 56 - 8 - 84;
+
+                fill_rect(a, bx_rem, y4 + 1, 84, row_h - 2,
+                          hover(a, bx_rem, y4, 84, row_h) ? C_BTN_HI : C_BTN);
+                frame_rect(a, bx_rem, y4, 84, row_h,
+                           hover(a, bx_rem, y4, 84, row_h) ? C_ACCENT
+                                                           : C_BORDER);
+                hit_add(a, bx_rem + 1, y4 + 1, 82, row_h - 2, CMD_REMOVE, j);
+                draw_text(a, bx_rem + 12, y4 + (row_h - line_h(2)) / 2,
+                          "REMOVE", C_RED, 2);
+
+                fill_rect(a, bx_edit, y4 + 1, 56, row_h - 2,
+                          hover(a, bx_edit, y4, 56, row_h) ? C_BTN_HI : C_BTN);
+                frame_rect(a, bx_edit, y4, 56, row_h,
+                           hover(a, bx_edit, y4, 56, row_h) ? C_ACCENT
+                                                            : C_BORDER);
+                hit_add(a, bx_edit + 1, y4 + 1, 54, row_h - 2, CMD_EDIT, j);
+                draw_text(a, bx_edit + 10, y4 + (row_h - line_h(2)) / 2,
+                          "EDIT", C_ACCENT, 2);
+
+                draw_text(a, x + 8, y4 + (row_h - line_h(2)) / 2, it->ip,
+                          C_TEXT, 2);
+                draw_text_cut(a, bx_rem - 6 - 96, y4 + (row_h - 8) / 2, sl,
+                              scol, 1, 96);
+
+                y4 += row_h + 1;
+            }
+        }
+        y += rh + 8;
+        if (y > a->left_maxy) a->left_maxy = y;
+    }
 }
 
 /* ====================================================== pannello destro */
@@ -827,6 +894,7 @@ static void dialog_open(App *a, int edit_idx)
     a->dlg_edit = edit_idx;
     a->dlg_msg[0] = '\0';
     a->dlg_drop = FALSE;
+    SDL_StartTextInput(a->win);
 
     if (edit_idx >= 0) {
         snprintf(a->dlg_ip, sizeof(a->dlg_ip), "%s",
@@ -890,6 +958,7 @@ static void dialog_submit(App *a)
         if (cfg_save(a->cfg)) {
             a->dlg = FALSE;
             a->dlg_drop = FALSE;
+            SDL_StopTextInput(a->win);
             reconcile(a, 0);
         } else {
             snprintf(a->dlg_msg, sizeof(a->dlg_msg),
@@ -914,6 +983,7 @@ static void dialog_submit(App *a)
         if (cfg_save(a->cfg)) {
             a->dlg = FALSE;
             a->dlg_drop = FALSE;
+            SDL_StopTextInput(a->win);
             reconcile(a, 0);
         } else {
             snprintf(a->dlg_msg, sizeof(a->dlg_msg),
@@ -955,6 +1025,7 @@ static void dialog_submit(App *a)
         a->dlg_msg[0] = '\0';
         a->dlg = FALSE;
         a->dlg_drop = FALSE;
+        SDL_StopTextInput(a->win);
         reconcile(a, 0);
     } else {
         snprintf(a->dlg_msg, sizeof(a->dlg_msg),
@@ -1009,10 +1080,18 @@ static BOOL route_is_ours(const App *a, const HostRoute *hr,
                           const RouteConfigItem *it)
 {
     int idx = net_index_of_ifindex(&a->nets, hr->ifindex);
-    if (idx < 0)
-        return TRUE;   /* ifIndex non piu' presente: resto nostro */
-    const NetInterface *ni = net_resolve(&a->nets, it->guid, it->name);
-    return ni && ni->ifindex == hr->ifindex;
+    if (idx >= 0) {
+        const NetInterface *ni = net_resolve(&a->nets, it->guid, it->name);
+        return ni && ni->ifindex == hr->ifindex;
+    }
+    /* ifIndex non piu' presente tra le interfacce: la route e' nostra SOLO
+     * se coincide esattamente con gli ultimi parametri noti con cui fu
+     * creata. Una route di terze parti (es. VPN disinstallata) verso lo
+     * stesso IP non viene quindi cancellata per sbaglio. */
+    if (hr->ifindex != it->last_ifindex)
+        return FALSE;
+    return it->last_gateway[0] &&
+           _stricmp(hr->gateway, it->last_gateway) == 0;
 }
 
 static void delete_owned_routes(App *a, const char *ip, const char *guid)
@@ -1104,6 +1183,7 @@ static void cmd_do(App *a, CmdId cmd, int idx)
     case CMD_DLG_CANCEL:
         a->dlg = FALSE;
         a->dlg_drop = FALSE;
+        SDL_StopTextInput(a->win);
         break;
     case CMD_DLG_DROP:
         a->dlg_drop = !a->dlg_drop;
@@ -1258,6 +1338,7 @@ static void handle_event(App *a, SDL_Event *e)
             } else if (e->key.key == SDLK_ESCAPE) {
                 a->dlg = FALSE;
                 a->dlg_drop = FALSE;
+                SDL_StopTextInput(a->win);
                 a->redraw = TRUE;
             } else if (e->key.key == SDLK_RETURN) {
                 cmd_do(a, CMD_DLG_ADD, -1);

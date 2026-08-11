@@ -127,6 +127,9 @@ static void cli_reap(void)
     for (int i = g_npending - 1; i >= 0; i--) {
         if (g_pending[i].h &&
             WaitForSingleObject(g_pending[i].h, 0) == WAIT_OBJECT_0) {
+            DWORD ec = 0;
+            GetExitCodeProcess(g_pending[i].h, &ec);
+            dbg("[ROUTE] route.exe terminato exit=%lu (%s)", ec, g_pending[i].ip);
             CloseHandle(g_pending[i].h);
             g_pending[i].h = NULL;
         }
@@ -172,8 +175,10 @@ static void cli_run(const wchar_t *cmdline, const char *ip)
 
     /* CREATE_NO_WINDOW: nessuna console lampeggiante, nessuna shell. */
     if (!CreateProcessW(NULL, (LPWSTR)cmdline, NULL, NULL, FALSE,
-                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
+                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        dbg("[ROUTE] CreateProcessW FALLITO (%lu): %S", GetLastError(), cmdline);
         return;
+    }
     CloseHandle(pi.hThread);
 
     if (g_npending < MAX_PENDING_CLI) {
@@ -192,7 +197,7 @@ static void route_cli_persistent_add(const char *ip, const char *gateway,
 {
     wchar_t cmd[512];
     swprintf(cmd, 512,
-             L"route -p add %S mask 255.255.255.255 %S if %lu",
+             L"route -p add %hs mask 255.255.255.255 %hs if %lu",
              ip, gateway, ifindex);
     cli_run(cmd, ip);
 }
@@ -205,10 +210,10 @@ static void route_cli_delete(const char *ip, const char *gateway,
 {
     wchar_t cmd[512];
     if (ifindex != 0)
-        swprintf(cmd, 512, L"route delete %S mask 255.255.255.255 %S if %lu",
+        swprintf(cmd, 512, L"route delete %hs mask 255.255.255.255 %hs if %lu",
                  ip, gateway, ifindex);
     else
-        swprintf(cmd, 512, L"route delete %S mask 255.255.255.255 %S",
+        swprintf(cmd, 512, L"route delete %hs mask 255.255.255.255 %hs",
                  ip, gateway);
     cli_run(cmd, ip);
 }

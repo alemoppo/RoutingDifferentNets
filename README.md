@@ -31,8 +31,15 @@ after a reboot or after the tether disconnects and reconnects.
   re-creates missing ones automatically.
 - **Does not touch foreign routes** — if another program (e.g. a VPN) has its
   own `/32` route to the same destination, it is left untouched. The app only
-  removes routes that belong to the configured adapter (same GUID) or point to
-  an ifIndex that no longer exists.
+  removes routes that belong to the configured adapter (same GUID) or, when the
+  ifIndex is no longer present on the system, that exactly match the last-known
+  `last_gateway`/`last_ifindex` the rule was created with. In both cases the
+  exact destination + prefix + gateway (+ ifIndex) must match, so a third-party
+  persistent route is never deleted blindly.
+- **Orphan-rule management** — rules whose adapter is currently absent (e.g.
+  the tether is unplugged) are shown in a dedicated "Interfacce assenti:" panel
+  with their own `REMOVE`/`EDIT` buttons, so they can still be cleaned up even
+  when no reachable interface hosts them.
 - **REFRESH** — recalculates the tables and also **adopts existing manual
   host routes** (e.g. added via `route add` / `New-NetRoute`). A route is
   matched to an interface primarily through its **ifIndex → adapter GUID**
@@ -95,7 +102,9 @@ privileges). The window shows:
 
 - **Left panel** — network interfaces (name, IPv4, gateway, ifIndex, metric,
   whether the default route passes through it) and the list of IPs assigned to
-  each one, with per-IP `EDIT` / `REMOVE` buttons.
+  each one, with per-IP `EDIT` / `REMOVE` buttons. When any configured rule's
+  adapter is currently absent, an additional **"Interfacce assenti:"** panel
+  lists those orphan rules with their own `REMOVE`/`EDIT` buttons.
 - **Right panel** — routing rules table (IP, configured interface, status)
   and a status summary. Buttons: `ADD IP`, `REFRESH`, `APPLY`.
 
@@ -134,13 +143,19 @@ libraries):
 ```json
 {
   "routes": [
-    { "ip": "37.244.28.101", "interface": "Ethernet 2", "guid": "{...}" }
+    { "ip": "37.244.28.101", "interface": "Ethernet 2", "guid": "{...}",
+      "last_gateway": "192.168.42.129", "last_ifindex": 11 }
   ]
 }
 ```
 
 Rules are identified by IP; the interface is stored as friendly name (for
 display) + adapter GUID (as the persistent identity). Maximum 256 rules.
+
+`last_gateway` / `last_ifindex` record the parameters each rule was last created
+with. They are refreshed whenever a rule is reconciled and are used to target
+the exact persistent entry when the adapter is absent (see Limits below), so
+`REMOVE` can always issue a precise `route delete ... if <n>`.
 
 ## Project layout
 
@@ -188,6 +203,12 @@ backend_test.exe config <f>  -> show rules saved in <f>
   saved in `config.json` (`last_gateway`/`last_ifindex`), so only the exact
   managed entry is targeted. If no such parameters are known, the app refuses
   the delete rather than risk touching a third-party persistent route.
+- Command-line arguments passed to `route.exe` are formatted with `%hs` inside
+  the wide `swprintf` format strings, so the ASCII IP/gateway strings are
+  converted to UTF-16 correctly (plain `%S` on MinGW-w64 can emit malformed
+  commands). Since `route delete` returns a non-zero exit code on a malformed
+  command line, the exact command is always built and verified against the
+  last-known parameters.
 - Route metric: the app sets `route metric 1` (minimum). Windows selects the
   winning route by summing the *interface* metric and the *route* metric, so
   the /32 entry is preferred but a VPN route toward the same IP with a lower

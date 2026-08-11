@@ -47,8 +47,9 @@ BOOL cfg_add(Config *c, const char *ip, const char *name, const char *guid);
 /* In caso di modifica dell'interfaccia aggiorna la regola esistente. */
 BOOL cfg_update(Config *c, const char *ip, const char *name, const char *guid);
 
-/* Aggiorna gli ultimi parametri noti della route per quella regola. */
-void cfg_set_last(Config *c, const char *ip, const char *gateway,
+/* Aggiorna gli ultimi parametri noti della route per quella regola.
+ * Ritorna TRUE se il valore e' cambiato (per decidere se salvare). */
+BOOL cfg_set_last(Config *c, const char *ip, const char *gateway,
                   unsigned long ifindex);
 
 /* Ritorna TRUE se la regola ha parametri noti per una cancellazione esatta. */
