@@ -1156,12 +1156,23 @@ static void cmd_do(App *a, CmdId cmd, int idx)
                                       sizeof(eb));
             else
                 del_ok = delete_owned_routes(a, ip, it->guid);
+
+            /* Rimuovi e salva la configurazione SOLO se la cancellazione e'
+             * riuscita (o le route erano gia' assenti: NOT_FOUND == successo).
+             * Se fallisce davvero, la regola resta configurata per ritentarla. */
+            if (!del_ok) {
+                snprintf(a->opmsg, sizeof(a->opmsg),
+                         "Errore: route %s non eliminata (%s) - regola mantenuta.",
+                         ip, eb[0] ? eb : "errore");
+                dbg("[GUI] REMOVE %s: cancellazione fallita, regola mantenuta",
+                    ip);
+                reconcile(a, 0);
+                break;
+            }
             cfg_remove(a->cfg, ip);
             if (cfg_save(a->cfg)) {
                 snprintf(a->opmsg, sizeof(a->opmsg),
-                         del_ok ? "Regola %s rimossa, route eliminata."
-                                : "Regola %s rimossa, MA route non eliminata: %s",
-                         ip, del_ok ? "" : eb[0] ? eb : "errore");
+                         "Regola %s rimossa, route eliminata.", ip);
             } else {
                 snprintf(a->opmsg, sizeof(a->opmsg),
                          "ERRORE: salvataggio configurazione fallito.");

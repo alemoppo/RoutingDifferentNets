@@ -249,7 +249,12 @@ static BOOL route_cli_delete(const char *ip, const char *gateway,
         swprintf(cmd, 512, L"route delete %hs mask 255.255.255.255 %hs",
                  ip, gateway);
     DWORD rc = cli_run_sync(cmd, ip);
-    return rc != CLI_EXIT_SPAWN_FAIL && rc == 0;
+    /* route.exe delete e' IDEMPOTENTE: ritorna exit 0 sia quando la voce viene
+     * davvero rimossa sia quando era gia' assente (NOT_FOUND, verificato
+     * empiricamente). Quindi NOT_FOUND ha successo qui. Fallisce solo se il
+     * processo non e' partito (spawn fail) o termina con exit != 0 (errore
+     * reale, es. sintassi/sistema): in quel caso il chiamante e' avvisato. */
+    return rc == 0;
 }
 
 /* ------------------------------------------------------ API native (netio) */
