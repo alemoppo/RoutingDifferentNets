@@ -15,7 +15,11 @@ struct NetMon {
     HANDLE           hExit;      /* evento esterno per lo stop            */
     HANDLE           hThread;    /* thread del monitor                    */
     HANDLE           hNotify[NOTIFY_COUNT];
-    volatile LONG    halt;       /* flag di stop (esplicito e affidabile)  */
+    /* Stato di stop. Scrittura da monitor_stop() e lettura dal thread SI
+     * SOLO tramite primitive interlocked (InterlockedExchange/Interlocked-
+     * CompareExchange): rendono esplicita la visibilita' e l'ordine di
+     * memoria tra i due thread. Nessun accesso diretto. */
+    LONG             halt;
     net_change_cb    cb;
     void            *user;
 };
@@ -75,7 +79,7 @@ static DWORD WINAPI monitor_thread(LPVOID p)
     BOOL retry = !register_all(m);
 
     for (;;) {
-        if (m->halt)
+        if (InterlockedCompareExchange(&m->halt, 0, 0))
             break;   /* uscita esplicita/autoritativa, indipendente da hExit */
 
         /* Array di SOLI handle validi: hExit (sempre) + le notifiche attive.
@@ -97,7 +101,7 @@ static DWORD WINAPI monitor_thread(LPVOID p)
         DWORD waitms = retry ? 2000 : 1000;
         DWORD r = WaitForMultipleObjects((DWORD)nw, waits, FALSE, waitms);
 
-        if (m->halt)
+        if (InterlockedCompareExchange(&m->halt, 0, 0))
             break;
         if (r == WAIT_OBJECT_0)
             break;                       /* stop richiesto (hExit) */
@@ -169,19 +173,38 @@ void monitor_stop(NetMon *m)
         return;
 
     /* Catturiamo PRIMA tutti gli handle di cui abbiamo bisogno: dopo la
-     * segnalazione il thread puo' liberare `m` in parallelo, quindi non
-     * dobbiamo MAI rileggere la struttura. */
+     * pubblicazione dello stop il thread puo' liberare `m` in parallelo,
+     * quindi non dobbiamo MAI rileggere la struttura. */
     HANDLE ht = m->hThread;
     HANDLE he = m->hExit;
 
-    /* Segnala l'evento (per svegliare il wait del thread, che vede hExit nel
-     * vettore di WaitForMultipleObjects) e imposta il flag `halt`, che e' la
-     * via di uscita AUTORITATIVA e affidabile del loop (ricontrollato a ogni
-     * risveglio bounded, mai INFINITE). Segnaliamo PRIMA di scrivere halt
-     * cosi' il SetEvent non puo' mai finire su un handle gia' chiuso dal
-     * thread. */
+    /* PROTOCOLLO DI STOP (elimina la race del free(m) concorrente):
+     *
+     *   monitor_stop                    monitor_thread
+     *   ------------                    --------------
+     *   InterlockedExchange(halt,1) ----------------->  (vede halt al prossimo
+     *                                                   risveglio bounded)
+     *   SetEvent(he) -------------------------------->  wake (WAIT_OBJECT_0)
+     *   wait<=5000ms  <------------------------------  break, cancel_all,
+     *                                                   CloseHandle(hExit),
+     *                                                   free(m)
+     *   CloseHandle(ht) (solo la nostra referenza)
+     *
+     * L'ULTIMO accesso di monitor_stop() a `m` e' InterlockedExchange(halt):
+     * avviene PRIMA di SetEvent(he), quindi prima che il thread possa essere
+     * svegliato e liberare `m`. Da SetEvent in poi usiamo SOLO le copie
+     * locali ht/he. Anche se il thread si svegliasse da solo sul suo timeout
+     * bounded (senza SetEvent), vedrebbe halt=1 e uscirebbe: ma a quel punto
+     * monitor_stop avra' comunque gia' smesso di toccare `m`. Nessuna finesta
+     * in cui il thread fa free(m) e poi monitor_stop accede a `m`.
+     *
+     * InterlockedExchange rende esplicita la sincronizzazione: scrittura con
+     * barriera globale e lettura atomica nel thread, cosi' halt e' sempre
+     * visibile/subito-ordined prima della segnalazione. Segnaliamo dopo la
+     * pubblicazione dello stop (e mai il contrario) anche per non far finire
+     * SetEvent su un handle gia' chiuso. */
+    InterlockedExchange(&m->halt, 1);
     SetEvent(he);
-    m->halt = 1;
 
     /* Reap bounded (5000 ms, teardown/shutdown only). Il thread, avendo visto
      * `halt`, esce entro il suo wait bounded massimo (~2s) e da SOLO esegue
