@@ -30,34 +30,40 @@ static void cancel_all(NetMon *m)
 }
 
 /* Registra le notifiche di rete. Ritorna FALSE se almeno una registrazione e'
- * fallita (in tal caso il chiamante programma un retry senza busy loop). Gli
- * handle falliti restano NULL e vengono sostituiti da hExit nel wait, cosi'
- * NON vengono inseriti handle duplicati o non validi nell'array. */
+ * fallita (in tal caso il chiamante programma un retry senza busy loop).
+ * Le API restituiscono direttamente un NETIO_STATUS: usiamo il return value,
+ * NON GetLastError(). Gli handle falliti restano NULL.
+ * Il contatore `registered` indica quante notifiche sono attive, cosi' la
+ * thread sa quanti handle validi inserire nell'array di WaitForMultipleObjects
+ * (niente placeholder duplicati: l'array contiene solo handle reali e hExit
+ * compare una sola volta come ultimo elemento). */
 static BOOL register_all(NetMon *m)
 {
+    NETIO_STATUS st;
     BOOL ok = TRUE;
 
     cancel_all(m);
     /* AF_UNSPEC: intercetta cambiamenti IPv4/IPv6 in modo indistinto. */
-    if (NotifyIpInterfaceChange(AF_UNSPEC, NULL, NULL, FALSE, &m->hNotify[0])
-            != NO_ERROR) {
-        dbg("[MON] NotifyIpInterfaceChange fallito (%lu)", GetLastError());
+    st = NotifyIpInterfaceChange(AF_UNSPEC, NULL, NULL, FALSE, &m->hNotify[0]);
+    if (st != NO_ERROR) {
+        dbg("[MON] NotifyIpInterfaceChange fallito (%lu)", st);
         m->hNotify[0] = NULL;
         ok = FALSE;
     }
-    if (NotifyUnicastIpAddressChange(AF_UNSPEC, NULL, NULL, FALSE,
-                                     &m->hNotify[1]) != NO_ERROR) {
-        dbg("[MON] NotifyUnicastIpAddressChange fallito (%lu)",
-            GetLastError());
+    st = NotifyUnicastIpAddressChange(AF_UNSPEC, NULL, NULL, FALSE,
+                                      &m->hNotify[1]);
+    if (st != NO_ERROR) {
+        dbg("[MON] NotifyUnicastIpAddressChange fallito (%lu)", st);
         m->hNotify[1] = NULL;
         ok = FALSE;
     }
-    if (NotifyRouteChange2(AF_UNSPEC, NULL, NULL, FALSE, &m->hNotify[2])
-            != NO_ERROR) {
-        dbg("[MON] NotifyRouteChange2 fallito (%lu)", GetLastError());
+    st = NotifyRouteChange2(AF_UNSPEC, NULL, NULL, FALSE, &m->hNotify[2]);
+    if (st != NO_ERROR) {
+        dbg("[MON] NotifyRouteChange2 fallito (%lu)", st);
         m->hNotify[2] = NULL;
         ok = FALSE;
     }
+
     return ok;
 }
 
@@ -68,31 +74,35 @@ static DWORD WINAPI monitor_thread(LPVOID p)
     BOOL retry = !register_all(m);
 
     for (;;) {
+        /* Array di SOLI handle validi: hExit (sempre) + le notifiche attive.
+         * hExit e' l'ultimo elemento e compare UNA sola volta. */
         HANDLE waits[NOTIFY_COUNT + 1];
-        waits[0] = m->hExit;
+        int nw = 0;
+        waits[nw++] = m->hExit;
         for (int i = 0; i < NOTIFY_COUNT; i++)
-            waits[1 + i] = m->hNotify[i] ? m->hNotify[i] : m->hExit;
+            if (m->hNotify[i])
+                waits[nw++] = m->hNotify[i];
 
         /* Se una notifica non e' registrata, usiamo un timeout di retry
          * (basso costo: il thread resta in wait, nessun busy loop di CPU).
          * Con TUTTE le notifiche attive restiamo su INFINITE -> ~0% CPU. */
         DWORD waitms = retry ? 2000 : INFINITE;
-        DWORD r = WaitForMultipleObjects(NOTIFY_COUNT + 1, waits,
-                                         FALSE, waitms);
+        DWORD r = WaitForMultipleObjects((DWORD)nw, waits, FALSE, waitms);
+
         if (r == WAIT_OBJECT_0)
-            break;                       /* stop richiesto */
+            break;                       /* stop richiesto (hExit) */
         if (r == WAIT_FAILED) {
             dbg("[MON] WaitForMultipleObjects fallito (%lu)", GetLastError());
             retry = TRUE;
             continue;
         }
 
-        /* WAIT_OBJECT_0+1 .. +NOTIFY_COUNT: notifica di rete reali.
-         * La GUI rifarà un reconcile completo. */
-        if (r - WAIT_OBJECT_0 > 0 && r - WAIT_OBJECT_0 <= NOTIFY_COUNT) {
-            if (m->cb)
-                m->cb(m->user);
-        }
+        /* r > 0: una notifica di rete reale (non hExit). La GUI rifara' un
+         * reconcile completo. Il valore di r indica SOLO che qualcosa e'
+         * cambiato: e' sicuro perche' ogni notifica registrata mappa 1:1 a
+         * un handle valido nell'array. */
+        if (m->cb)
+            m->cb(m->user);
 
         /* Ri-registra: le Notify* sono one-shot. WAIT_TIMEOUT = retry. */
         retry = !register_all(m);

@@ -105,113 +105,113 @@ BOOL net_valid_ipv4(const char *s)
 }
 
 /* ------------------------------------------------------------ route.exe (async)
- * route.exe viene lanciato SEMPRE in modo ASINCRONO per non bloccare la GUI
- * (anche le DELETE, che prima usavano una variante sincrona). Per lo STESSO
- * destination IP le operazioni vengono serializzate: prima di lanciare un
- * comando attendiamo il completamento di un eventuale comando precedente
- * ancora in volo. route.exe termina in pochi ms, quindi l'attesa per la
- * serializzazione e' trascurabile. Questo evita la race "add persistente" vs
- * "delete persistente" dove l'ordine di completamento non sarebbe garantito.
+ * route.exe viene lanciato SEMPRE in modo ASINCRONO e MAI dal thread GUI.
+ * Non esiste alcun wait sincrono: le operazioni vengono accodate in una coda
+ * FIFO e lanciate solo quando (a) nessun altro route.exe e' in volo per lo
+ * stesso destination IP (serializzazione) e (b) c'e' un process-slot libero.
+ * Se non ci sono le condizioni il comando resta PENDING e viene ripartito
+ * alla prossima routes_cli_poll()/cli_drain(): niente operazioni perse.
  *
- * L'exit code di ogni processo viene recuperato in cli_reap() (chiamato a
- * ogni nuova operazione e dal loop GUI), quindi il programma conosce sempre
- * l'esito reale di route.exe anche se la GUI non si e' mai bloccata. */
+ * Questo garantisce:
+ *   - l'ordine richiesto dal chiamante (ADD/DELETE/ADD FIFO);
+ *   - serializzazione per ip (mai due route.exe sullo stesso IP);
+ *   - GUI mai bloccata da route.exe;
+ *   - controllo dell'exit code recuperato in cli_reap().
+ */
 
-/* Dimensionata in modo coerente con il numero massimo di route: ogni route
- * puo' avere al massimo 1 operazione in volo (add *oppure* delete, perche'
- * sono serializzate per IP). Allochiamo un margine per gli eventuali add di
- * configurazione. Se la coda fosse piena (caso limite), cli_run() attende
- * invece di scartare l'operazione (vedi sotto). */
-#define MAX_PENDING_CLI (CONFIG_MAX_ROUTES + 16)
+/* Numero massimo di route.exe CONTEMPORANEAMENTE in volo. Limita il picco di
+ * processi/handle ma NON la capacita' di accodamento: i comandi eccedenti
+ * restano pending (vedi MAX_CLI_OP). */
+#define MAX_CONCURRENT_CLI CONFIG_MAX_ROUTES
+
+/* Capacita' totale della coda (in volo + pending). Dimensionata abbondante
+ * rispetto al numero massimo di route *per* le operazioni chiuse in serie
+ * sullo stesso IP (es. una reconcile che fa molti delete+add). */
+#define MAX_CLI_OP (CONFIG_MAX_ROUTES * 2 + 16)
+
+typedef enum { CLI_ADD, CLI_DELETE } CliKind;
+
 typedef struct {
-    char   ip[NET_IP_MAX];
-    HANDLE h;
-} PendingCli;
+    char           ip[NET_IP_MAX];
+    char           gw[NET_IP_MAX];
+    unsigned long  ifindex;
+    CliKind        kind;
+    BOOL           started;   /* TRUE: route.exe lanciato (handle valido) */
+    HANDLE         h;         /* handle processo, valido solo se started */
+} CliOp;
 
-static PendingCli g_pending[MAX_PENDING_CLI];
-static int g_npending = 0;
+static CliOp g_cli[MAX_CLI_OP];
+static int g_ncli = 0;          /* operazioni in coda (pending + started) */
 
-/* Raccoglie i processi gia' terminati e compatta la lista. Recupera e logga
- * l'exit code reale di ogni route.exe. */
+/* TRUE se un'operazione e' in VOLO (processo vivo) per lo stesso IP. */
+static BOOL cli_ip_busy(const char *ip)
+{
+    for (int i = 0; i < g_ncli; i++)
+        if (g_cli[i].started && strcmp(g_cli[i].ip, ip) == 0)
+            return TRUE;
+    return FALSE;
+}
+
+/* Numero di route.exe correntemente in volo. */
+static int cli_inflight(void)
+{
+    int n = 0;
+    for (int i = 0; i < g_ncli; i++)
+        if (g_cli[i].started)
+            n++;
+    return n;
+}
+
+/* Raccoglie i processi gia' terminati (rimuove l'operazione) e recupera il
+ * loro exit code reale. Non blocca mai (wait timeout = 0). */
 static void cli_reap(void)
 {
-    for (int i = g_npending - 1; i >= 0; i--) {
-        if (g_pending[i].h &&
-            WaitForSingleObject(g_pending[i].h, 0) == WAIT_OBJECT_0) {
+    int w = 0;
+    for (int i = 0; i < g_ncli; i++) {
+        if (g_cli[i].started &&
+            WaitForSingleObject(g_cli[i].h, 0) == WAIT_OBJECT_0) {
             DWORD ec = 0;
-            GetExitCodeProcess(g_pending[i].h, &ec);
-            dbg("[ROUTE] route.exe terminato exit=%lu (%s)", ec, g_pending[i].ip);
-            CloseHandle(g_pending[i].h);
-            g_pending[i].h = NULL;
+            GetExitCodeProcess(g_cli[i].h, &ec);
+            /* route.exe delete e' idempotente: "impossibile trovare elemento"
+             * termina comunque con exit 0, quindi NOT_FOUND resta successo.
+             * Un exit != 0 e' un errore reale e viene segnalato. */
+            if (g_cli[i].kind == CLI_DELETE && ec != 0)
+                dbg("[ROUTE] delete %s/32 exit=%lu (ERRORE reale)", g_cli[i].ip, ec);
+            else
+                dbg("[ROUTE] route.exe terminato exit=%lu (%s)", ec, g_cli[i].ip);
+            CloseHandle(g_cli[i].h);
+            continue;   /* operazione consumata */
         }
+        g_cli[w++] = g_cli[i];
     }
-    int w = 0;
-    for (int i = 0; i < g_npending; i++)
-        if (g_pending[i].h)
-            g_pending[w++] = g_pending[i];
-    g_npending = w;
+    g_ncli = w;
 }
 
-/* Attende (con timeout di sicurezza) il completamento di ogni route.exe
- * ancora in volo per lo stesso IP destinazione. */
-static void cli_wait_dest(const char *ip)
+/* Costruisce la riga di comando per l'operazione accodata. */
+static int cli_build_cmd(const CliOp *op, wchar_t *cmd, size_t n)
 {
-    for (int i = 0; i < g_npending; i++) {
-        if (g_pending[i].h && strcmp(g_pending[i].ip, ip) == 0) {
-            WaitForSingleObject(g_pending[i].h, 3000);
-            CloseHandle(g_pending[i].h);
-            g_pending[i].h = NULL;
-        }
-    }
-    int w = 0;
-    for (int i = 0; i < g_npending; i++)
-        if (g_pending[i].h)
-            g_pending[w++] = g_pending[i];
-    g_npending = w;
+    if (op->kind == CLI_ADD)
+        return swprintf(cmd, n, L"route -p add %hs mask 255.255.255.255 %hs if %lu",
+                        op->ip, op->gw, op->ifindex);
+    if (op->ifindex != 0)
+        return swprintf(cmd, n, L"route delete %hs mask 255.255.255.255 %hs if %lu",
+                        op->ip, op->gw, op->ifindex);
+    return swprintf(cmd, n, L"route delete %hs mask 255.255.255.255 %hs",
+                    op->ip, op->gw);
 }
 
-/* Traccia un processo route.exe appena lanciato. Se la coda e' piena non
- * scarta MAI l'operazione: attende (sempre con timeout) il completamento
- * del processo piu' vecchio per liberare uno slot, poi inserisce il nuovo.
- * La coda e' dimensionata per il numero massimo di route, quindi nel caso
- * normale questo ramo non e' mai raggiunto. */
-static BOOL cli_track(HANDLE h, const char *ip)
+/* Prova a lanciare un'operazione pending: avviata SOLO se l'IP e' libero e
+ * c'e' un process-slot. Se fallisce, resta pending. Ritorna TRUE se avviata. */
+static BOOL cli_start_op(CliOp *op)
 {
-    int guard = 0;
-    while (g_npending >= MAX_PENDING_CLI && guard++ < 200) {
-        cli_reap();
-        if (g_npending < MAX_PENDING_CLI)
-            break;
-        /* Libera lo slot piu' vecchio (completamento atteso a breve). */
-        for (int i = 0; i < g_npending; i++) {
-            if (g_pending[i].h) {
-                WaitForSingleObject(g_pending[i].h, 3000);
-                CloseHandle(g_pending[i].h);
-                g_pending[i].h = NULL;
-                break;
-            }
-        }
-        cli_reap();
-    }
-    if (g_npending >= MAX_PENDING_CLI) {
-        dbg("[ROUTE] coda CLI piena (%d): processo non tracciato", g_npending);
+    if (cli_ip_busy(op->ip))
+        return FALSE;                       /* serializzazione per IP */
+    if (cli_inflight() >= MAX_CONCURRENT_CLI)
+        return FALSE;                       /* backpressure non bloccante */
+
+    wchar_t cmd[512];
+    if (cli_build_cmd(op, cmd, 512) < 0)
         return FALSE;
-    }
-    snprintf(g_pending[g_npending].ip, sizeof(g_pending[g_npending].ip),
-             "%s", ip);
-    g_pending[g_npending].h = h;
-    g_npending++;
-    return TRUE;
-}
-
-/* Lancia route.exe: prima serializza con eventuali operazioni in corso sullo
- * stesso IP, poi parte senza bloccare la GUI. Ritorna TRUE se il processo e'
- * stato avviato E tracciato. Il handle resta in coda per evitare race con
- * operazioni successive sullo stesso IP; l'exit code e' letto in cli_reap(). */
-static BOOL cli_run(const wchar_t *cmdline, const char *ip)
-{
-    cli_reap();
-    cli_wait_dest(ip);
 
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
@@ -220,47 +220,76 @@ static BOOL cli_run(const wchar_t *cmdline, const char *ip)
     si.cb = sizeof(si);
 
     /* CREATE_NO_WINDOW: nessuna console lampeggiante, nessuna shell. */
-    if (!CreateProcessW(NULL, (LPWSTR)cmdline, NULL, NULL, FALSE,
+    if (!CreateProcessW(NULL, (LPWSTR)cmd, NULL, NULL, FALSE,
                         CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        dbg("[ROUTE] CreateProcessW FALLITO (%lu): %S", GetLastError(), cmdline);
+        dbg("[ROUTE] CreateProcessW FALLITO (%lu): %S", GetLastError(), cmd);
         return FALSE;
     }
     CloseHandle(pi.hThread);
-    return cli_track(pi.hProcess, ip);
+    op->started = TRUE;
+    op->h = pi.hProcess;
+    return TRUE;
+}
+
+/* Avvia quante piu' operazioni pending possibile (FIFO). Chiamato dopo ogni
+ * accodamento e da routes_cli_poll(). Non blocca mai. */
+static void cli_drain(void)
+{
+    cli_reap();
+    for (int pass = 0; pass < g_ncli; pass++) {
+        int advanced = 0;
+        for (int i = 0; i < g_ncli; i++) {
+            if (!g_cli[i].started && cli_start_op(&g_cli[i]))
+                advanced = 1;
+        }
+        if (!advanced)
+            break;
+    }
+}
+
+/* Accoda un'operazione route.exe. Ritorna TRUE se accodata (potrebbe ancora
+ * essere pending). FALSE solo se la coda e' piena: in tal caso logga (mai
+ * drop silenzioso) e non perde l'informazione che l'operazione non e' stata
+ * neppure programmata. */
+static BOOL cli_enqueue(const char *ip, const char *gw, unsigned long ifindex,
+                        CliKind kind)
+{
+    if (g_ncli >= MAX_CLI_OP) {
+        dbg("[ROUTE] coda CLI piena (%d): op %s non accodata",
+            MAX_CLI_OP, kind == CLI_DELETE ? "delete" : "add");
+        return FALSE;
+    }
+    CliOp *op = &g_cli[g_ncli];
+    memset(op, 0, sizeof(*op));
+    snprintf(op->ip, sizeof(op->ip), "%s", ip);
+    snprintf(op->gw, sizeof(op->gw), "%s", gw ? gw : "");
+    op->ifindex = ifindex;
+    op->kind = kind;
+    g_ncli++;
+    cli_drain();   /* tenta l'avvio immediato se possibile */
+    return TRUE;
 }
 
 /* route -p add: voce persistente che sopravvive al riavvio (asincrono). */
 static void route_cli_persistent_add(const char *ip, const char *gateway,
                                      unsigned long ifindex)
 {
-    wchar_t cmd[512];
-    swprintf(cmd, 512,
-             L"route -p add %hs mask 255.255.255.255 %hs if %lu",
-             ip, gateway, ifindex);
-    cli_run(cmd, ip);
+    cli_enqueue(ip, gateway, ifindex, CLI_ADD);
 }
 
 /* route delete SPECIFICO: destination + mask + gateway [+ if]. Mai senza
  * gateway: una cancellazione alla cieca potrebbe rimuovere la voce
  * persistente di terze parti verso lo stesso IP.
  *
- * ASINCRONO: lancia route.exe senza bloccare la GUI; l'esito reale viene
- * recuperato in cli_reap(). Ritorna TRUE se il processo e' stato avviato e
- * tracciato. Il NON risultato di route.exe (NOT_FOUND) e' comportamento
- * idempotente accettato: la cancellazione di una route gia' assente e'
- * considerata successo (verificato empiricamente: exit 0 anche da assente).
- * Un fallimento di spawn (CreateProcessW) va considerato errore reale. */
+ * ASINCRONO: accoda route.exe senza bloccare la GUI; l'esito reale viene
+ * recuperato in cli_reap(). Il NOT_FOUND (exit 0) e' idempotente ed e'
+ * considerato successo. Un fallimento di spawn (CreateProcessW) o un exit
+ * != 0 va considerato errore reale. Ritorna TRUE se l'operazione e' stata
+ * accodata per l'esecuzione. */
 static BOOL route_cli_delete(const char *ip, const char *gateway,
                              unsigned long ifindex)
 {
-    wchar_t cmd[512];
-    if (ifindex != 0)
-        swprintf(cmd, 512, L"route delete %hs mask 255.255.255.255 %hs if %lu",
-                 ip, gateway, ifindex);
-    else
-        swprintf(cmd, 512, L"route delete %hs mask 255.255.255.255 %hs",
-                 ip, gateway);
-    return cli_run(cmd, ip);
+    return cli_enqueue(ip, gateway, ifindex, CLI_DELETE);
 }
 
 /* ------------------------------------------------------ API native (netio) */
@@ -342,12 +371,13 @@ static BOOL route_nio_delete_exact(const char *ip, unsigned long prefix,
     return ok;
 }
 
-/* Recupera gli exit code dei route.exe pendenti (lancia cli_reap). Chiamato
- * periodicamente dal loop GUI anche quando non vengono avviate nuove
- * operazioni: cosi' l'esito di ogni route.exe asincrono viene sempre letto. */
+/* Recupera gli exit code dei route.exe già terminati e avvia le operazioni
+ * ancora PENDING (backpressure non bloccante). Chiamato periodicamente dal
+ * loop GUI: cosi' le operazioni accodate partono appena liberi il process-slot
+ * o l'IP, e ogni esito viene sempre letto. Non blocca mai (wait timeout = 0). */
 void routes_cli_poll(void)
 {
-    cli_reap();
+    cli_drain();
 }
 
 /* ---------------------------------------------------------------- API pub */
