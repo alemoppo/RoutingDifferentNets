@@ -107,26 +107,39 @@ BOOL net_valid_ipv4(const char *s)
 /* ------------------------------------------------------------ route.exe (async)
  * route.exe viene lanciato SEMPRE in modo ASINCRONO e MAI dal thread GUI.
  * Non esiste alcun wait sincrono: le operazioni vengono accodate in una coda
- * FIFO e lanciate solo quando (a) nessun altro route.exe e' in volo per lo
- * stesso destination IP (serializzazione) e (b) c'e' un process-slot libero.
+ * e avviate solo quando (a) nessun altro route.exe e' in volo per lo stesso
+ * destination IP (serializzazione per-IP) e (b) c'e' un process-slot libero.
  * Se non ci sono le condizioni il comando resta PENDING e viene ripartito
  * alla prossima routes_cli_poll()/cli_drain(): niente operazioni perse.
  *
+ * NOTA sulla semantica: la coda NON e' una FIFO globale. La proprieta' reale
+ * garantita e' la serializzazione PER IP: per lo stesso destination le
+ * operazioni partono nell'ordine in cui sono state richieste (ADD/DELETE/ADD),
+ * mentre IP differenti possono essere in volo in parallelo, fino a
+ * MAX_CONCURRENT_CLI. Esempio valido:
+ *   ADD A -> running, ADD B -> running, DELETE A -> pending, DELETE B -> pending
+ *   (DELETE A parte appena ADD A termina, DELETE B appena ADD B termina)
+ *
  * Questo garantisce:
- *   - l'ordine richiesto dal chiamante (ADD/DELETE/ADD FIFO);
- *   - serializzazione per ip (mai due route.exe sullo stesso IP);
+ *   - serializzazione per IP (mai due route.exe sullo stesso IP);
+ *   - parallelismo tra IP differenti (fino a MAX_CONCURRENT_CLI);
  *   - GUI mai bloccata da route.exe;
  *   - controllo dell'exit code recuperato in cli_reap().
  */
 
-/* Numero massimo di route.exe CONTEMPORANEAMENTE in volo. Limita il picco di
- * processi/handle ma NON la capacita' di accodamento: i comandi eccedenti
- * restano pending (vedi MAX_CLI_OP). */
-#define MAX_CONCURRENT_CLI CONFIG_MAX_ROUTES
+/* Numero massimo di route.exe CONTEMPORANEAMENTE in volo (parallelismo).
+ * 16 basta per servire piu' IP in parallelo ma evita di lanciare centinaia di
+ * processi in un reconcile massivo: ogni route.exe e' veloce (ordine dei ms),
+ * quindi con 16 slot le code fluiscono senza saturarsi. NON limita la
+ * capacita' di accodamento (vedi MAX_CLI_OP): i comandi eccedenti restano
+ * pending. */
+#define MAX_CONCURRENT_CLI 16
 
-/* Capacita' totale della coda (in volo + pending). Dimensionata abbondante
- * rispetto al numero massimo di route *per* le operazioni chiuse in serie
- * sullo stesso IP (es. una reconcile che fa molti delete+add). */
+/* Capacita' totale della coda (in volo + pending). Indipendente da
+ * MAX_CONCURRENT_CLI: dimensionata abbondante rispetto al numero massimo di
+ * route *per* le operazioni chiuse in serie sullo stesso IP (es. una
+ * reconcile che fa molti delete+add), cosi' da poter accodare tutto senza
+ * mai perdere operazioni. */
 #define MAX_CLI_OP (CONFIG_MAX_ROUTES * 2 + 16)
 
 typedef enum { CLI_ADD, CLI_DELETE } CliKind;
@@ -231,7 +244,9 @@ static BOOL cli_start_op(CliOp *op)
     return TRUE;
 }
 
-/* Avvia quante piu' operazioni pending possibile (FIFO). Chiamato dopo ogni
+/* Avvia quante piu' operazioni pending possibile, nel rispetto della
+ * serializzazione per-IP e del limite MAX_CONCURRENT_CLI (NOTA: non FIFO
+ * globale -- IP differenti possono girare in parallelo). Chiamato dopo ogni
  * accodamento e da routes_cli_poll(). Non blocca mai. */
 static void cli_drain(void)
 {
@@ -270,11 +285,15 @@ static BOOL cli_enqueue(const char *ip, const char *gw, unsigned long ifindex,
     return TRUE;
 }
 
-/* route -p add: voce persistente che sopravvive al riavvio (asincrono). */
-static void route_cli_persistent_add(const char *ip, const char *gateway,
+/* route -p add: voce persistente che sopravvive al riavvio (asincrono).
+ * Ritorna TRUE se l'operazione e' stata ACCODATA per l'esecuzione (potrebbe
+ * essere ancora pending), FALSE solo se la coda era piena: in tal caso la
+ * persistenza NON e' programmata e verra' ritentata da un successivo
+ * reconcile (che ri-accoda la persistenza per ogni route in stato OK). */
+static BOOL route_cli_persistent_add(const char *ip, const char *gateway,
                                      unsigned long ifindex)
 {
-    cli_enqueue(ip, gateway, ifindex, CLI_ADD);
+    return cli_enqueue(ip, gateway, ifindex, CLI_ADD);
 }
 
 /* route delete SPECIFICO: destination + mask + gateway [+ if]. Mai senza
@@ -284,8 +303,12 @@ static void route_cli_persistent_add(const char *ip, const char *gateway,
  * ASINCRONO: accoda route.exe senza bloccare la GUI; l'esito reale viene
  * recuperato in cli_reap(). Il NOT_FOUND (exit 0) e' idempotente ed e'
  * considerato successo. Un fallimento di spawn (CreateProcessW) o un exit
- * != 0 va considerato errore reale. Ritorna TRUE se l'operazione e' stata
- * accodata per l'esecuzione. */
+ * != 0 va considerato errore reale.
+ *
+ * Semantica del return: TRUE = operazione ACCETTATA in coda (NON significa
+ * che route.exe sia gia' completato con exit 0). FALSE = coda piena, quindi
+ * il delete persistente non e' nemmeno stato accodato: il chiamante (route_delete)
+ * deve propagarlo. */
 static BOOL route_cli_delete(const char *ip, const char *gateway,
                              unsigned long ifindex)
 {
@@ -400,7 +423,9 @@ BOOL route_add_persistent(const char *ip, const char *gateway,
     if (routes_snapshot(&snap) &&
         routes_find_host_exact(&snap, ip, 32, ifindex, gateway)) {
         dbg("[ROUTE] %s/32 OK (gia' presente) - assicuro persistenza", ip);
-        route_cli_persistent_add(ip, gateway, ifindex);
+        if (!route_cli_persistent_add(ip, gateway, ifindex))
+            dbg("[ROUTE] %s/32: enqueue persistenza fallita (coda piena), "
+                "ritentata al prossimo reconcile", ip);
         return TRUE;
     }
 
@@ -416,9 +441,15 @@ BOOL route_add_persistent(const char *ip, const char *gateway,
         }
     }
 
-    /* 3) Persistenza asincrona: non bloccante per la GUI. */
-    if (ok)
-        route_cli_persistent_add(ip, gateway, ifindex);
+    /* 3) Persistenza asincrona: non bloccante per la GUI. L'eventuale
+     * fallimento di accodamento (coda piena) non annulla la route attiva gia'
+     * creata: viene solo loggato e la persistenza e' ritentata da un
+     * successivo reconcile. */
+    if (ok) {
+        if (!route_cli_persistent_add(ip, gateway, ifindex))
+            dbg("[ROUTE] %s/32: enqueue persistenza fallita (coda piena), "
+                "sara' ritentato da reconcile", ip);
+    }
 
     if (ok) {
         dbg("[ROUTE] %s/32 aggiunta via %s (if %lu)", ip, gateway, ifindex);
@@ -430,6 +461,14 @@ BOOL route_add_persistent(const char *ip, const char *gateway,
     return FALSE;
 }
 
+/* Rimuove una route (attiva con API nativa + persistente con route.exe).
+ * Rimane ASINCRONO per la parte persistente: il return TRUE significa
+ * "delete attivo eseguito E delete persistente ACCODATA" -- NON che route.exe
+ * sia gia' terminato con exit 0 (quello lo recupera cli_reap()). FALSE = la
+ * delete attiva e' fallita, oppure la parte persistente non e' stata accodata
+ * (coda piena): in entrambi i casi il chiamante NON deve considerare la route
+ * rimossa. Un eventuale errore asincrono di route.exe non lascia stato
+ * incoerente: la config resta presente e il successivo reconcile() riconcilia. */
 BOOL route_delete(const char *ip, const char *gateway, unsigned long ifindex,
                   char *err, size_t errsz)
 {

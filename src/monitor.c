@@ -15,6 +15,7 @@ struct NetMon {
     HANDLE           hExit;      /* evento esterno per lo stop            */
     HANDLE           hThread;    /* thread del monitor                    */
     HANDLE           hNotify[NOTIFY_COUNT];
+    volatile LONG    halt;       /* flag di stop (esplicito e affidabile)  */
     net_change_cb    cb;
     void            *user;
 };
@@ -74,6 +75,9 @@ static DWORD WINAPI monitor_thread(LPVOID p)
     BOOL retry = !register_all(m);
 
     for (;;) {
+        if (m->halt)
+            break;   /* uscita esplicita/autoritativa, indipendente da hExit */
+
         /* Array di SOLI handle validi: hExit (sempre) + le notifiche attive.
          * hExit e' l'ultimo elemento e compare UNA sola volta. */
         HANDLE waits[NOTIFY_COUNT + 1];
@@ -83,12 +87,18 @@ static DWORD WINAPI monitor_thread(LPVOID p)
             if (m->hNotify[i])
                 waits[nw++] = m->hNotify[i];
 
-        /* Se una notifica non e' registrata, usiamo un timeout di retry
-         * (basso costo: il thread resta in wait, nessun busy loop di CPU).
-         * Con TUTTE le notifiche attive restiamo su INFINITE -> ~0% CPU. */
-        DWORD waitms = retry ? 2000 : INFINITE;
+        /* ATTENZIONE: MAI INFINITE. Il wait e' SEMPRE bounded cosi' il loop
+         * torna periodicamente a rileggere `halt`: in questo modo l'uscita
+         * e' garantita anche nel caso (osservato) in cui la segnalazione di
+         * hExit non svegli attendibilmente il WaitForMultipleObjects.
+         * Un wake ~1/s e' ~0% CPU (nessun busy loop). Il timeout "idle" non
+         * provoca ne' callback ne' ri-registrazione: gli handle restano
+         * registrati e immutati. */
+        DWORD waitms = retry ? 2000 : 1000;
         DWORD r = WaitForMultipleObjects((DWORD)nw, waits, FALSE, waitms);
 
+        if (m->halt)
+            break;
         if (r == WAIT_OBJECT_0)
             break;                       /* stop richiesto (hExit) */
         if (r == WAIT_FAILED) {
@@ -96,15 +106,17 @@ static DWORD WINAPI monitor_thread(LPVOID p)
             retry = TRUE;
             continue;
         }
+        if (r == WAIT_TIMEOUT)
+            continue;   /* idle: nessun cambiamento, si aspetta ancora */
 
-        /* r > 0: una notifica di rete reale (non hExit). La GUI rifara' un
-         * reconcile completo. Il valore di r indica SOLO che qualcosa e'
+        /* r in [1,nw): una notifica di rete reale (non hExit). La GUI rifara'
+         * un reconcile completo. Il valore di r indica SOLO che qualcosa e'
          * cambiato: e' sicuro perche' ogni notifica registrata mappa 1:1 a
          * un handle valido nell'array. */
         if (m->cb)
             m->cb(m->user);
 
-        /* Ri-registra: le Notify* sono one-shot. WAIT_TIMEOUT = retry. */
+        /* Ri-registra: le Notify* sono one-shot. */
         retry = !register_all(m);
     }
 
@@ -140,18 +152,30 @@ void monitor_stop(NetMon *m)
     if (!m)
         return;
 
-    /* Segnala l'uscita e attende che il thread sia DAVVERO terminato prima
-     * di toccare la struttura: la thread termina cancellando le notifiche e
-     * ritornando; solo dopo possiamo liberare senza rischio di use-after-free.
-     * Il thread si sblocca subito su hExit, quindi l'attesa e' immediata. */
+    /* Imposta il flag esplicito e segnala l'evento, poi attende che il thread
+     * sia DAVVERO terminato prima di toccare la struttura. Grazie al flag
+     * `halt` + wait bounded nel loop, il thread esce entro ~1s. Per non
+     * bloccare mai la GUI (il wait qui gira sul thread grafico) usiamo un
+     * timeout limite: se (caso mai) il thread non fosse uscito, NON lo
+     * liberiamo (evita use-after-free) e procediamo: il processo, in uscita,
+     * terminera' comunque il thread rimasto appeso. */
+    m->halt = 1;
     SetEvent(m->hExit);
     if (m->hThread) {
-        WaitForSingleObject(m->hThread, INFINITE);
-        CloseHandle(m->hThread);
-        m->hThread = NULL;
+        if (WaitForSingleObject(m->hThread, 5000) == WAIT_TIMEOUT)
+            dbg("[MON] stop: thread monitor non terminato in 5s (esito fallback)");
+        else {
+            CloseHandle(m->hThread);
+            m->hThread = NULL;
+        }
     }
-    cancel_all(m);
-    if (m->hExit)
-        CloseHandle(m->hExit);
-    free(m);
+    if (!m->hThread) {
+        cancel_all(m);
+        if (m->hExit)
+            CloseHandle(m->hExit);
+        free(m);
+    }
+    /* se m->hThread e' rimasto valido, significa che il thread non e' uscito:
+     * lasciamo `m` vivo (non liberato) per sicurezza; verra' reclamato
+     * all'uscita del processo. */
 }
