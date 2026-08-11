@@ -28,6 +28,84 @@ BOOL cfg_default_path(char *out, size_t n)
 
 /* ------------------------------------------------------------ mini-JSON */
 
+/* Scrive in out[n] la versione JSON-escapata di `s`. Lega i caratteri
+ * speciali e i control-char (<0x20) come \u00XX. Ritorna il numero di byte
+ * scritti (escluso '\0'), o -1 se il buffer non e' sufficiente: in tal caso
+ * out[] contiene solo il terminatore e il chiamante NON deve proseguire. */
+static int json_escape_string(char *out, size_t n, const char *s)
+{
+    size_t k = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        const char *esc = NULL;
+        switch (*p) {
+            case '"':  esc = "\\\""; break;
+            case '\\': esc = "\\\\"; break;
+            case '\n': esc = "\\n";  break;
+            case '\r': esc = "\\r";  break;
+            case '\t': esc = "\\t";  break;
+            case '\b': esc = "\\b";  break;
+            case '\f': esc = "\\f";  break;
+            default:
+                if (*p < 0x20) {
+                    if (k + 7 >= n) return -1;   /* \u00XX + '\0' */
+                    k += (size_t)snprintf((char *)out + k, n - k,
+                                          "\\u%04X", *p);
+                } else {
+                    if (k + 1 >= n) return -1;
+                    out[k++] = (char)*p;
+                }
+                continue;
+        }
+        size_t el = strlen(esc);
+        if (k + el + 1 > n)
+            return -1;
+        memcpy(out + k, esc, el);
+        k += el;
+    }
+    if (k + 1 > n)
+        return -1;
+    out[k] = '\0';
+    return (int)k;
+}
+
+/* Decodifica un'escape JSON (\", \\, \n, \r, \t, \b, \f, \uXXXX) nella
+ * posizione [c, end). Ritorna il carattere e avanzare c di conseguenza,
+ * oppure FALSE se l'escape e' malformata. */
+static BOOL js_unescape_one(const char **c, const char *end, unsigned char *out)
+{
+    if (*c >= end)
+        return FALSE;
+    unsigned char ch = (unsigned char)*(*c)++;
+    switch (ch) {
+        case '"':  *out = '"';  return TRUE;
+        case '\\': *out = '\\'; return TRUE;
+        case 'n':  *out = '\n'; return TRUE;
+        case 'r':  *out = '\r'; return TRUE;
+        case 't':  *out = '\t'; return TRUE;
+        case 'b':  *out = '\b'; return TRUE;
+        case 'f':  *out = '\f'; return TRUE;
+        case 'u': {
+            unsigned v = 0;
+            for (int i = 0; i < 4; i++) {
+                if (*c >= end)
+                    return FALSE;
+                char hex = (char)*(*c)++;
+                v <<= 4;
+                if (hex >= '0' && hex <= '9')      v |= (unsigned)(hex - '0');
+                else if (hex >= 'a' && hex <= 'f') v |= (unsigned)(hex - 'a' + 10);
+                else if (hex >= 'A' && hex <= 'F') v |= (unsigned)(hex - 'A' + 10);
+                else return FALSE;
+            }
+            if (v > 0xFF)      /* questi campi sono solo ASCII/UTF-8 a 1 byte */
+                return FALSE;
+            *out = (unsigned char)v;
+            return TRUE;
+        }
+        default:
+            return FALSE;      /* escape sconosciuta -> JSON malformato */
+    }
+}
+
 /* Cerca la chiave `key` all'interno del buffer [beg,end) e copia il valore
  * stringa in out[n]. Ritorna TRUE se trovata. */
 static BOOL js_field(const char *beg, const char *end, const char *key,
@@ -53,8 +131,19 @@ static BOOL js_field(const char *beg, const char *end, const char *key,
             return FALSE;   /* stringa senza virgoletta di chiusura: malformata */
         c++; /* apostrofo iniziale */
         size_t k = 0;
-        while (c < end && *c != '"' && k + 1 < n)
-            out[k++] = *c++;
+        while (c < end && *c != '"') {
+            if (k + 2 > n)
+                return FALSE;   /* overflow: troncheremmo il valore */
+            if (*c == '\\') {
+                c++;
+                unsigned char d = 0;
+                if (!js_unescape_one(&c, end, &d))
+                    return FALSE;
+                out[k++] = (char)d;
+            } else {
+                out[k++] = *c++;
+            }
+        }
         if (c >= end || *c != '"')
             return FALSE;   /* valore non terminato -> JSON corrotto */
         out[k] = '\0';
@@ -216,12 +305,26 @@ BOOL cfg_save(const Config *c)
         }
     }
 
-    /* Serializza in un buffer in memoria (mai direttamente sul file). */
-    size_t cap = 256 + (size_t)c->count *
-                        (NET_IP_MAX * 2 + NET_NAME_MAX + NET_GUID_MAX + 80);
+    /* Serializza in un buffer in memoria (mai direttamente sul file). Ogni
+     * stringa viene JSON-escapata al volo (max 6 byte per char: \u00XX), quindi
+     * dimensioniamo per il caso peggiore e verifichiamo di nuovo per sicurezza.
+     */
+    size_t cap = 256;
+    for (int i = 0; i < c->count; i++) {
+        const RouteConfigItem *it = &c->items[i];
+        cap += (size_t)strlen(it->ip)     * 6 + 1;
+        cap += (size_t)strlen(it->name)   * 6 + 1;
+        cap += (size_t)strlen(it->guid)   * 6 + 1;
+        cap += (size_t)strlen(it->last_gateway) * 6 + 1;
+        cap += 80;
+    }
     char *buf = (char *)malloc(cap);
     if (!buf)
         return FALSE;
+
+    /* Buffer temporanei per l'escaping di ogni campo stringa. */
+    char eip[NET_IP_MAX * 6 + 4], ename[NET_NAME_MAX * 6 + 4];
+    char eguid[NET_GUID_MAX * 6 + 4], egw[NET_IP_MAX * 6 + 4];
 
     size_t p = 0;
     int r = snprintf(buf + p, cap - p, "{\n  \"routes\": [\n");
@@ -230,16 +333,23 @@ BOOL cfg_save(const Config *c)
 
     for (int i = 0; i < c->count; i++) {
         const RouteConfigItem *it = &c->items[i];
+        if (json_escape_string(eip,   sizeof(eip),   it->ip)          < 0 ||
+            json_escape_string(ename, sizeof(ename), it->name)        < 0 ||
+            json_escape_string(eguid, sizeof(eguid), it->guid)        < 0 ||
+            json_escape_string(egw,   sizeof(egw),   it->last_gateway) < 0) {
+            free(buf);
+            return FALSE;
+        }
         if (it->last_gateway[0] && it->last_ifindex != 0)
             r = snprintf(buf + p, cap - p,
                  "    { \"ip\": \"%s\", \"interface\": \"%s\", \"guid\": \"%s\","
                  " \"last_gateway\": \"%s\", \"last_ifindex\": %lu }%s\n",
-                 it->ip, it->name, it->guid, it->last_gateway,
+                 eip, ename, eguid, egw,
                  it->last_ifindex, (i + 1 < c->count) ? "," : "");
         else
             r = snprintf(buf + p, cap - p,
                  "    { \"ip\": \"%s\", \"interface\": \"%s\", \"guid\": \"%s\" }%s\n",
-                 it->ip, it->name, it->guid,
+                 eip, ename, eguid,
                  (i + 1 < c->count) ? "," : "");
         if (r < 0 || (size_t)r >= cap - p) { free(buf); return FALSE; }
         p += (size_t)r;
@@ -252,10 +362,18 @@ BOOL cfg_save(const Config *c)
 
     /* Scrittura atomica: config.json.tmp -> flush -> MoveFileExW.
      * Se un qualsiasi passo fallisce il vecchio config.json resta intatto. */
-    wchar_t wpath[MAX_PATH + 8], wtmp[MAX_PATH + 8];
-    MultiByteToWideChar(CP_ACP, 0, c->path, -1, wpath, MAX_PATH);
-    wpath[MAX_PATH - 1] = L'\0';
-    swprintf(wtmp, MAX_PATH + 8, L"%s.tmp", wpath);
+    wchar_t wpath[MAX_PATH + 16], wtmp[MAX_PATH + 16];
+    int wlen = MultiByteToWideChar(CP_ACP, 0, c->path, -1, wpath,
+                                   (int)(sizeof(wpath) / sizeof(wpath[0])));
+    if (wlen <= 0) {
+        dbg("[CFG] MultiByteToWideChar fallito (err=%lu)", GetLastError());
+        free(buf);
+        return FALSE;
+    }
+    if (swprintf(wtmp, MAX_PATH + 16, L"%s.tmp", wpath) < 0) {
+        free(buf);
+        return FALSE;
+    }
 
     HANDLE h = CreateFileW(wtmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
                            FILE_ATTRIBUTE_NORMAL, NULL);

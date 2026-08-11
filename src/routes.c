@@ -105,14 +105,24 @@ BOOL net_valid_ipv4(const char *s)
 }
 
 /* ------------------------------------------------------------ route.exe (async)
- * route.exe viene lanciato in modo ASINCRONO per non bloccare la GUI, ma per
- * lo STESSO destination IP le operazioni vengono serializzate: prima di
- * lanciare un comando attendiamo il completamento di un eventuale comando
- * precedente ancora in volo (route.exe termina in pochi ms, quindi l'attesa
- * e' trascurabile). Questo evita la race "add persistente" vs "delete
- * persistente" dove l'ordine di completamento non sarebbe garantito. */
+ * route.exe viene lanciato SEMPRE in modo ASINCRONO per non bloccare la GUI
+ * (anche le DELETE, che prima usavano una variante sincrona). Per lo STESSO
+ * destination IP le operazioni vengono serializzate: prima di lanciare un
+ * comando attendiamo il completamento di un eventuale comando precedente
+ * ancora in volo. route.exe termina in pochi ms, quindi l'attesa per la
+ * serializzazione e' trascurabile. Questo evita la race "add persistente" vs
+ * "delete persistente" dove l'ordine di completamento non sarebbe garantito.
+ *
+ * L'exit code di ogni processo viene recuperato in cli_reap() (chiamato a
+ * ogni nuova operazione e dal loop GUI), quindi il programma conosce sempre
+ * l'esito reale di route.exe anche se la GUI non si e' mai bloccata. */
 
-#define MAX_PENDING_CLI 32
+/* Dimensionata in modo coerente con il numero massimo di route: ogni route
+ * puo' avere al massimo 1 operazione in volo (add *oppure* delete, perche'
+ * sono serializzate per IP). Allochiamo un margine per gli eventuali add di
+ * configurazione. Se la coda fosse piena (caso limite), cli_run() attende
+ * invece di scartare l'operazione (vedi sotto). */
+#define MAX_PENDING_CLI (CONFIG_MAX_ROUTES + 16)
 typedef struct {
     char   ip[NET_IP_MAX];
     HANDLE h;
@@ -121,7 +131,8 @@ typedef struct {
 static PendingCli g_pending[MAX_PENDING_CLI];
 static int g_npending = 0;
 
-/* Raccoglie i processi gia' terminati e compatta la lista. */
+/* Raccoglie i processi gia' terminati e compatta la lista. Recupera e logga
+ * l'exit code reale di ogni route.exe. */
 static void cli_reap(void)
 {
     for (int i = g_npending - 1; i >= 0; i--) {
@@ -159,10 +170,45 @@ static void cli_wait_dest(const char *ip)
     g_npending = w;
 }
 
+/* Traccia un processo route.exe appena lanciato. Se la coda e' piena non
+ * scarta MAI l'operazione: attende (sempre con timeout) il completamento
+ * del processo piu' vecchio per liberare uno slot, poi inserisce il nuovo.
+ * La coda e' dimensionata per il numero massimo di route, quindi nel caso
+ * normale questo ramo non e' mai raggiunto. */
+static BOOL cli_track(HANDLE h, const char *ip)
+{
+    int guard = 0;
+    while (g_npending >= MAX_PENDING_CLI && guard++ < 200) {
+        cli_reap();
+        if (g_npending < MAX_PENDING_CLI)
+            break;
+        /* Libera lo slot piu' vecchio (completamento atteso a breve). */
+        for (int i = 0; i < g_npending; i++) {
+            if (g_pending[i].h) {
+                WaitForSingleObject(g_pending[i].h, 3000);
+                CloseHandle(g_pending[i].h);
+                g_pending[i].h = NULL;
+                break;
+            }
+        }
+        cli_reap();
+    }
+    if (g_npending >= MAX_PENDING_CLI) {
+        dbg("[ROUTE] coda CLI piena (%d): processo non tracciato", g_npending);
+        return FALSE;
+    }
+    snprintf(g_pending[g_npending].ip, sizeof(g_pending[g_npending].ip),
+             "%s", ip);
+    g_pending[g_npending].h = h;
+    g_npending++;
+    return TRUE;
+}
+
 /* Lancia route.exe: prima serializza con eventuali operazioni in corso sullo
- * stesso IP, poi parte senza bloccare la GUI. Il handle resta tracciato per
- * evitare race con operazioni successive sullo stesso IP. */
-static void cli_run(const wchar_t *cmdline, const char *ip)
+ * stesso IP, poi parte senza bloccare la GUI. Ritorna TRUE se il processo e'
+ * stato avviato E tracciato. Il handle resta in coda per evitare race con
+ * operazioni successive sullo stesso IP; l'exit code e' letto in cli_reap(). */
+static BOOL cli_run(const wchar_t *cmdline, const char *ip)
 {
     cli_reap();
     cli_wait_dest(ip);
@@ -177,52 +223,13 @@ static void cli_run(const wchar_t *cmdline, const char *ip)
     if (!CreateProcessW(NULL, (LPWSTR)cmdline, NULL, NULL, FALSE,
                         CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         dbg("[ROUTE] CreateProcessW FALLITO (%lu): %S", GetLastError(), cmdline);
-        return;
+        return FALSE;
     }
     CloseHandle(pi.hThread);
-
-    if (g_npending < MAX_PENDING_CLI) {
-        snprintf(g_pending[g_npending].ip, sizeof(g_pending[g_npending].ip),
-                 "%s", ip);
-        g_pending[g_npending].h = pi.hProcess;
-        g_npending++;
-    } else {
-        CloseHandle(pi.hProcess);
-    }
+    return cli_track(pi.hProcess, ip);
 }
 
-/* Variante SINCRONA di route.exe: attende il completamento (route.exe termina
- * in pochi ms) e ritorna l'exit code, oppure 0xFFFFFFFF se il processo non e'
- * stato nemmeno lanciato. Usata solo per le cancellazioni, dove serve
- * conoscere l'esito reale di route.exe per propagarlo al chiamante. */
-#define CLI_EXIT_SPAWN_FAIL 0xFFFFFFFFu
-static DWORD cli_run_sync(const wchar_t *cmdline, const char *ip)
-{
-    cli_reap();
-    cli_wait_dest(ip);
-
-    STARTUPINFOW si;
-    PROCESS_INFORMATION pi;
-    memset(&si, 0, sizeof(si));
-    memset(&pi, 0, sizeof(pi));
-    si.cb = sizeof(si);
-
-    if (!CreateProcessW(NULL, (LPWSTR)cmdline, NULL, NULL, FALSE,
-                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        dbg("[ROUTE] CreateProcessW FALLITO (%lu): %S", GetLastError(), cmdline);
-        return CLI_EXIT_SPAWN_FAIL;
-    }
-    CloseHandle(pi.hThread);
-
-    DWORD rc = CLI_EXIT_SPAWN_FAIL;
-    if (WaitForSingleObject(pi.hProcess, 3000) == WAIT_OBJECT_0)
-        GetExitCodeProcess(pi.hProcess, &rc);
-    CloseHandle(pi.hProcess);
-    dbg("[ROUTE] route.exe sincrono exit=%lu (%s)", rc, ip);
-    return rc;
-}
-
-/* route -p add: voce persistente che sopravvive al riavvio. */
+/* route -p add: voce persistente che sopravvive al riavvio (asincrono). */
 static void route_cli_persistent_add(const char *ip, const char *gateway,
                                      unsigned long ifindex)
 {
@@ -235,9 +242,14 @@ static void route_cli_persistent_add(const char *ip, const char *gateway,
 
 /* route delete SPECIFICO: destination + mask + gateway [+ if]. Mai senza
  * gateway: una cancellazione alla cieca potrebbe rimuovere la voce
- * persistente di terze parti verso lo stesso IP. Eseguito in modo SINCRONO
- * perche' dobbiamo conoscere l'esito reale di route.exe e propagarlo.
- * Ritorna TRUE se route.exe e' partito e ha concluso con exit code 0. */
+ * persistente di terze parti verso lo stesso IP.
+ *
+ * ASINCRONO: lancia route.exe senza bloccare la GUI; l'esito reale viene
+ * recuperato in cli_reap(). Ritorna TRUE se il processo e' stato avviato e
+ * tracciato. Il NON risultato di route.exe (NOT_FOUND) e' comportamento
+ * idempotente accettato: la cancellazione di una route gia' assente e'
+ * considerata successo (verificato empiricamente: exit 0 anche da assente).
+ * Un fallimento di spawn (CreateProcessW) va considerato errore reale. */
 static BOOL route_cli_delete(const char *ip, const char *gateway,
                              unsigned long ifindex)
 {
@@ -248,13 +260,7 @@ static BOOL route_cli_delete(const char *ip, const char *gateway,
     else
         swprintf(cmd, 512, L"route delete %hs mask 255.255.255.255 %hs",
                  ip, gateway);
-    DWORD rc = cli_run_sync(cmd, ip);
-    /* route.exe delete e' IDEMPOTENTE: ritorna exit 0 sia quando la voce viene
-     * davvero rimossa sia quando era gia' assente (NOT_FOUND, verificato
-     * empiricamente). Quindi NOT_FOUND ha successo qui. Fallisce solo se il
-     * processo non e' partito (spawn fail) o termina con exit != 0 (errore
-     * reale, es. sintassi/sistema): in quel caso il chiamante e' avvisato. */
-    return rc == 0;
+    return cli_run(cmd, ip);
 }
 
 /* ------------------------------------------------------ API native (netio) */
@@ -334,6 +340,14 @@ static BOOL route_nio_delete_exact(const char *ip, unsigned long prefix,
 
     FreeMibTable(tab);
     return ok;
+}
+
+/* Recupera gli exit code dei route.exe pendenti (lancia cli_reap). Chiamato
+ * periodicamente dal loop GUI anche quando non vengono avviate nuove
+ * operazioni: cosi' l'esito di ogni route.exe asincrono viene sempre letto. */
+void routes_cli_poll(void)
+{
+    cli_reap();
 }
 
 /* ---------------------------------------------------------------- API pub */

@@ -29,20 +29,43 @@ static void cancel_all(NetMon *m)
     }
 }
 
-static void register_all(NetMon *m)
+/* Registra le notifiche di rete. Ritorna FALSE se almeno una registrazione e'
+ * fallita (in tal caso il chiamante programma un retry senza busy loop). Gli
+ * handle falliti restano NULL e vengono sostituiti da hExit nel wait, cosi'
+ * NON vengono inseriti handle duplicati o non validi nell'array. */
+static BOOL register_all(NetMon *m)
 {
+    BOOL ok = TRUE;
+
     cancel_all(m);
     /* AF_UNSPEC: intercetta cambiamenti IPv4/IPv6 in modo indistinto. */
-    NotifyIpInterfaceChange(AF_UNSPEC, NULL, NULL, FALSE, &m->hNotify[0]);
-    NotifyUnicastIpAddressChange(AF_UNSPEC, NULL, NULL, FALSE, &m->hNotify[1]);
-    NotifyRouteChange2(AF_UNSPEC, NULL, NULL, FALSE, &m->hNotify[2]);
+    if (NotifyIpInterfaceChange(AF_UNSPEC, NULL, NULL, FALSE, &m->hNotify[0])
+            != NO_ERROR) {
+        dbg("[MON] NotifyIpInterfaceChange fallito (%lu)", GetLastError());
+        m->hNotify[0] = NULL;
+        ok = FALSE;
+    }
+    if (NotifyUnicastIpAddressChange(AF_UNSPEC, NULL, NULL, FALSE,
+                                     &m->hNotify[1]) != NO_ERROR) {
+        dbg("[MON] NotifyUnicastIpAddressChange fallito (%lu)",
+            GetLastError());
+        m->hNotify[1] = NULL;
+        ok = FALSE;
+    }
+    if (NotifyRouteChange2(AF_UNSPEC, NULL, NULL, FALSE, &m->hNotify[2])
+            != NO_ERROR) {
+        dbg("[MON] NotifyRouteChange2 fallito (%lu)", GetLastError());
+        m->hNotify[2] = NULL;
+        ok = FALSE;
+    }
+    return ok;
 }
 
 static DWORD WINAPI monitor_thread(LPVOID p)
 {
     NetMon *m = (NetMon *)p;
 
-    register_all(m);
+    BOOL retry = !register_all(m);
 
     for (;;) {
         HANDLE waits[NOTIFY_COUNT + 1];
@@ -50,17 +73,29 @@ static DWORD WINAPI monitor_thread(LPVOID p)
         for (int i = 0; i < NOTIFY_COUNT; i++)
             waits[1 + i] = m->hNotify[i] ? m->hNotify[i] : m->hExit;
 
+        /* Se una notifica non e' registrata, usiamo un timeout di retry
+         * (basso costo: il thread resta in wait, nessun busy loop di CPU).
+         * Con TUTTE le notifiche attive restiamo su INFINITE -> ~0% CPU. */
+        DWORD waitms = retry ? 2000 : INFINITE;
         DWORD r = WaitForMultipleObjects(NOTIFY_COUNT + 1, waits,
-                                         FALSE, INFINITE);
-        if (r == WAIT_OBJECT_0 || r == WAIT_FAILED)
+                                         FALSE, waitms);
+        if (r == WAIT_OBJECT_0)
             break;                       /* stop richiesto */
+        if (r == WAIT_FAILED) {
+            dbg("[MON] WaitForMultipleObjects fallito (%lu)", GetLastError());
+            retry = TRUE;
+            continue;
+        }
 
-        /* Notifica di rete: la GUI rifarà un reconcile completo. */
-        if (m->cb)
-            m->cb(m->user);
+        /* WAIT_OBJECT_0+1 .. +NOTIFY_COUNT: notifica di rete reali.
+         * La GUI rifarà un reconcile completo. */
+        if (r - WAIT_OBJECT_0 > 0 && r - WAIT_OBJECT_0 <= NOTIFY_COUNT) {
+            if (m->cb)
+                m->cb(m->user);
+        }
 
-        /* Ri-registra: le Notify* sono one-shot. */
-        register_all(m);
+        /* Ri-registra: le Notify* sono one-shot. WAIT_TIMEOUT = retry. */
+        retry = !register_all(m);
     }
 
     cancel_all(m);

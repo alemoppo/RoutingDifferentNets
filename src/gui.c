@@ -286,10 +286,14 @@ static void draw_text_cut(App *a, int x, int y, const char *s, Uint32 col,
         draw_text(a, x, y, "...", col, scale);
         return;
     }
+    /* n e' derivato dalla larghezza grafica e puo' superare buf[]: limitiamolo
+     * a quanto realmente copibile. Deve sempre restare spazio per i 3
+     * caratteri "..." e per il terminatore '\0'. */
     char buf[256];
+    if (n > (int)sizeof(buf) - 4)
+        n = (int)sizeof(buf) - 4;
     memcpy(buf, s, (size_t)n);
-    buf[n] = 0;
-    strcat(buf, "...");
+    memcpy(buf + n, "...", 4);   /* copia 3 char + terminatori '\0' */
     draw_text(a, x, y, buf, col, scale);
 }
 
@@ -1462,6 +1466,8 @@ void gui_run(Config *cfg)
             reconcile(&a, 0);
             a.need_recon = 0;
         }
+
+        routes_cli_poll();   /* legge exit code dei route.exe asincroni */
 
         if (a.redraw) {
             draw_frame(&a);

@@ -88,12 +88,13 @@ Compiles each `src\*.c`, links `NetworkRouteManager.exe` and copies
 ### CMake
 
 ```
-cmake -G "MinGW Makefiles" -DMINGW=ON .
+cmake -G "MinGW Makefiles" -DMINGW=ON -DCMAKE_BUILD_TYPE=Release .
 cmake --build .
 ```
 
 The project requires the `MINGW` flag (set in toolchain files) and copies the
-two DLLs next to the executable after the build.
+two DLLs next to the executable after the build. `Release` applies `-O2
+-DNDEBUG`; it is the default when `CMAKE_BUILD_TYPE` is not given.
 
 ## Usage
 

@@ -4,6 +4,14 @@ project(NetworkRouteManager C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+# Release e' il tipo di build predefinito (l'uso normale dell'utente deve dare
+# una build ottimizzata). Per i generatori single-config (MinGW Makefiles /
+# Unix Makefiles) un CMAKE_BUILD_TYPE esplicito in fase di configurazione fa
+# selezionare i flag per-config.
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Tipo di build (default: Release)" FORCE)
+endif()
+
 if(NOT MINGW)
     message(FATAL_ERROR "Questo progetto richiede MinGW-w64 (vedi build.bat).")
 endif()
@@ -53,5 +61,7 @@ add_custom_command(TARGET NetworkRouteManager POST_BUILD
 # windres viene gestito automaticamente da CMake per i file .rc.
 set_source_files_properties(src/resources.rc PROPERTIES LANGUAGE RC)
 
-# Opzioni di compilazione per il progetto.
-target_compile_options(NetworkRouteManager PRIVATE -Wall -Wextra)
+# Opzioni di compilazione: Release ottimizzata, senza flags hardcoded globali.
+# -Wall/-Wextra si applicano a tutte le build; -O2/-DNDEBUG solo in Release.
+target_compile_options(NetworkRouteManager PRIVATE -Wall -Wextra
+    $<$<CONFIG:Release>:-O2;-DNDEBUG>)

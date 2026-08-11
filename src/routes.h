@@ -70,4 +70,8 @@ BOOL route_add_persistent(const char *ip, const char *gateway,
 BOOL route_delete(const char *ip, const char *gateway, unsigned long ifindex,
                   char *err, size_t errsz);
 
+/* Recupera e logga gli exit code dei route.exe asincroni pendenti. Da
+ * chiamare periodicamente dal loop GUI (senza attese bloccanti). */
+void routes_cli_poll(void);
+
 #endif /* ROUTES_H */
