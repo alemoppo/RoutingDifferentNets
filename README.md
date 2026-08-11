@@ -11,29 +11,43 @@ after a reboot or after the tether disconnects and reconnects.
 ## Features
 
 - **One rule per IP** — add a single IPv4 address, or a process name: the app
-  resolves every IP that process is connected to (TCP remote addresses, UDP
-  local addresses) and creates one rule per resolved address.
-- **Persistent, self-healing routes** — routes are created with
-  `route.exe -p` (persistent across reboots) and reinforced with the native
-  `CreateIpForwardEntry2` API when they do not show up in the routing table.
+  resolves every IP that process is connected to (TCP remote addresses only)
+  and creates one rule per resolved address. UDP sockets are ignored on
+  purpose: the UDP table exposes the machine's *local* address, not the remote
+  peer, and creating a route to a local address would be wrong.
+- **Persistent, self-healing routes** — routes are created with the native
+  `CreateIpForwardEntry2` API (no blocking of the GUI) and made persistent
+  across reboots via an *asynchronous* `route.exe -p` invocation. A route is
+  considered correct only when destination, prefix, ifIndex **and** gateway all
+  match the configured interface.
 - **Stable adapter identity** — rules store the adapter **GUID**, never the
   ifIndex or the local IPv4. The current ifIndex/gateway are resolved
-  dynamically at every snapshot, so rules survive adapter renumbering.
+  dynamically at every snapshot, so rules survive adapter renumbering,
+  tether disconnect/reconnect and gateway changes.
 - **Event-driven monitoring** — network changes are detected with
   `NotifyIpInterfaceChange` / `NotifyUnicastIpAddressChange` /
   `NotifyRouteChange2` (no polling, ~0% CPU at idle). On any change the app
-  re-reconciles and re-creates missing routes automatically, tolerating
-  tether disconnect/reconnect.
+  re-reconciles, removes its own stale routes (identified by adapter GUID) and
+  re-creates missing ones automatically.
+- **Does not touch foreign routes** — if another program (e.g. a VPN) has its
+  own `/32` route to the same destination, it is left untouched. The app only
+  removes routes that belong to the configured adapter (same GUID) or point to
+  an ifIndex that no longer exists.
 - **REFRESH** — recalculates the tables and also **adopts existing manual
-  host routes** (e.g. added via `route add` / `New-NetRoute`) whose next hop
-  matches the gateway of a managed interface.
-- **APPLY** — corrects conflicting routes and re-creates missing ones using
-  current network parameters.
+  host routes** (e.g. added via `route add` / `New-NetRoute`). A route is
+  matched to an interface primarily through its **ifIndex → adapter GUID**
+  (the gateway is only an additional check).
+- **APPLY** — re-runs the full reconciliation with current network parameters.
 - **Status panel** — per-rule status: `OK`, `OFFLINE`, `MISSING`, `WRONG`,
   `ERROR`, plus a summary with counts.
 - **Safe execution** — `route.exe` is spawned with `CreateProcessW`
   (`CREATE_NO_WINDOW`), never through `cmd.exe`/`system()`; all variable
   arguments are validated IPv4 addresses, so no shell injection is possible.
+- **Atomic config save** — `config.json` is written to a temp file, flushed
+  and atomically moved into place; a failed save never destroys the previous
+  file and is reported in the UI.
+- **Optional debug log** — compiling with `-DNRM_DEBUG` appends a diagnostic
+  log to `%TEMP%\nrm_debug.log`; the Release build has zero logging overhead.
 
 ## Requirements
 
@@ -138,7 +152,7 @@ src/
   routes.c      routing table snapshot + add/delete routes (CLI + native)
   config.c      JSON persistence (%LOCALAPPDATA%\...)
   monitor.c     event-driven change monitor (Notify* APIs, dedicated thread)
-  proc.c        process name -> connected IPs resolution (TCP/UDP tables)
+  proc.c        process name -> connected IPs resolution (TCP only)
   resources.rc  UAC manifest + version info
 build.bat       MinGW build script
 CMakeLists.txt  alternative CMake build
@@ -162,3 +176,13 @@ backend_test.exe config <f>  -> show rules saved in <f>
 - Administrator privileges required.
 - The default route (0.0.0.0/0) is never touched automatically; it is only
   displayed for reference.
+- Process → IP resolution covers TCP peers only (UDP is deliberately ignored,
+  see Features).
+- Persistence across reboots relies on `route.exe -p` launched asynchronously:
+  if the app is closed the same instant a route is added, the persistent entry
+  may be lost (the active route itself is created natively and remains until
+  reboot).
+- When a rule is removed while its interface is completely absent from the
+  system, the persistent entry is removed with `route.exe delete` for that
+  destination; in this edge case a foreign persistent `/32` route to the same
+  IP would also be removed.

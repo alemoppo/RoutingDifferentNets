@@ -1,13 +1,16 @@
 /*
- * proc.c - risoluzione degli IP IPv4 raggiunti da un processo.
+ * proc.c - risoluzione degli IP IPv4 remoti raggiunti da un processo.
  *
  * Porting di procedure e criteri dal progetto "ip_graph" (casella di testo
- * che accetta un IP o un nome di processo): se l'input non e' un IP,
- * vengono cercati tutti i processi con quel nome e, attraverso le tabelle
- * TCP/UDP con owner PID, raccolti gli indirizzi IP ad essi associati.
+ * che accetta un IP o un nome di processo): se l'input non e' un IP, vengono
+ * cercati tutti i processi con quel nome e, attraverso la tabella TCP con
+ * owner PID, raccolti gli indirizzi IP REMOTI ad essi associati.
  *
- * Nota (come in ip_graph): per TCP si considerano gli IP remoti delle
- * connessioni, per UDP si considerano gli IP locali dei socket.
+ * La tabella UDP NON viene usata: espone solo l'indirizzo LOCALE del socket,
+ * non il peer remoto. Creare una route verso un indirizzo locale della
+ * macchina sarebbe errato (il programma deve instradare IP remoti), quindi la
+ * funzionalita' processo -> IP e' limitata ai peer TCP. Questo e' voluto:
+ * la correttezza e' piu' importante della completezza.
  */
 
 #include "proc.h"
@@ -38,8 +41,7 @@ static int add_unique(char ips[PROC_MAX_IPS][NET_IP_MAX], int *count,
         if (strcmp(ips[i], ip) == 0)
             return 0;
     }
-    strncpy(ips[*count], ip, NET_IP_MAX - 1);
-    ips[*count][NET_IP_MAX - 1] = '\0';
+    snprintf(ips[*count], NET_IP_MAX, "%s", ip);
     (*count)++;
     return 1;
 }
@@ -146,36 +148,8 @@ int proc_resolve_ips(const char *name,
         }
     }
 
-    size = 0;
-    if (GetExtendedUdpTable(NULL, &size, FALSE, AF_INET, UDP_TABLE_OWNER_PID,
-                            0) == ERROR_INSUFFICIENT_BUFFER &&
-        size > 0) {
-        MIB_UDPTABLE_OWNER_PID *tbl = (MIB_UDPTABLE_OWNER_PID *)malloc(size);
-        if (tbl) {
-            if (GetExtendedUdpTable(tbl, &size, FALSE, AF_INET,
-                                    UDP_TABLE_OWNER_PID, 0) == NO_ERROR) {
-                for (DWORD i = 0; i < tbl->dwNumEntries; i++) {
-                    MIB_UDPROW_OWNER_PID *r = &tbl->table[i];
-                    if (!is_useful_ipv4(r->dwLocalAddr))
-                        continue;
-                    int match = 0;
-                    for (int k = 0; k < npid; k++) {
-                        if (r->dwOwningPid == pids[k]) {
-                            match = 1;
-                            break;
-                        }
-                    }
-                    if (!match)
-                        continue;
-                    char buf[NET_IP_MAX];
-                    addr_to_str(r->dwLocalAddr, buf, sizeof(buf));
-                    if (buf[0])
-                        add_unique(found, &nfound, buf);
-                }
-            }
-            free(tbl);
-        }
-    }
+    /* (UDP volutamente assente: la tabella UDP riporta solo l'IP locale del
+     * socket, che NON e' un peer remoto. Vedere commento in testa al file.) */
 
     for (int i = 0; i < nfound; i++)
         memcpy(ips[i], found[i], NET_IP_MAX);

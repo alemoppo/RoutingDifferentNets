@@ -10,6 +10,7 @@
  *   }
  */
 #include "config.h"
+#include "routes.h"   /* net_valid_ipv4: valida gli IP letti dal file */
 
 BOOL cfg_default_path(char *out, size_t n)
 {
@@ -48,11 +49,13 @@ static BOOL js_field(const char *beg, const char *end, const char *key,
         while (c < end && (*c == ' ' || *c == '\t' || *c == '\n' || *c == '\r'))
             c++;
         if (c >= end || *c != '"')
-            return FALSE;
+            return FALSE;   /* stringa senza virgoletta di chiusura: malformata */
         c++; /* apostrofo iniziale */
         size_t k = 0;
         while (c < end && *c != '"' && k + 1 < n)
             out[k++] = *c++;
+        if (c >= end || *c != '"')
+            return FALSE;   /* valore non terminato -> JSON corrotto */
         out[k] = '\0';
         return TRUE;
     }
@@ -110,7 +113,9 @@ void cfg_load(Config *c, const char *path)
         js_field(open + 1, close, "interface", name, sizeof(name));
         js_field(open + 1, close, "guid", guid, sizeof(guid));
 
-        if (has_ip && ip[0])
+        /* Solo destinazioni IPv4 valide: una voce corrotta non viene
+         * importata e non puo' compromettere il resto del file. */
+        if (has_ip && ip[0] && net_valid_ipv4(ip))
             cfg_add(c, ip, name, guid);
 
         pos = close + 1;
@@ -143,19 +148,53 @@ BOOL cfg_save(const Config *c)
         CreateDirectoryA(dir, NULL);
     }
 
-    FILE *f = fopen(c->path, "w");
-    if (!f)
+    /* Serializza in un buffer in memoria (mai direttamente sul file). */
+    size_t cap = 128 + (size_t)c->count *
+                        (NET_IP_MAX + NET_NAME_MAX + NET_GUID_MAX + 64);
+    char *buf = (char *)malloc(cap);
+    if (!buf)
         return FALSE;
 
-    fprintf(f, "{\n  \"routes\": [\n");
-    for (int i = 0; i < c->count; i++) {
+    size_t p = 0;
+    p += (size_t)snprintf(buf + p, cap - p, "{\n  \"routes\": [\n");
+    for (int i = 0; i < c->count && p < cap; i++) {
         const RouteConfigItem *it = &c->items[i];
-        fprintf(f, "    { \"ip\": \"%s\", \"interface\": \"%s\", \"guid\": \"%s\" }%s\n",
-                it->ip, it->name, it->guid,
-                (i + 1 < c->count) ? "," : "");
+        p += (size_t)snprintf(buf + p, cap - p,
+             "    { \"ip\": \"%s\", \"interface\": \"%s\", \"guid\": \"%s\" }%s\n",
+             it->ip, it->name, it->guid,
+             (i + 1 < c->count) ? "," : "");
     }
-    fprintf(f, "  ]\n}\n");
-    fclose(f);
+    if (p < cap)
+        snprintf(buf + p, cap - p, "  ]\n}\n");
+    size_t len = strlen(buf);
+
+    /* Scrittura atomica: config.json.tmp -> flush -> MoveFileExW.
+     * Se un qualsiasi passo fallisce il vecchio config.json resta intatto. */
+    wchar_t wpath[MAX_PATH + 8], wtmp[MAX_PATH + 8];
+    MultiByteToWideChar(CP_ACP, 0, c->path, -1, wpath, MAX_PATH);
+    wpath[MAX_PATH - 1] = L'\0';
+    swprintf(wtmp, MAX_PATH + 8, L"%s.tmp", wpath);
+
+    HANDLE h = CreateFileW(wtmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        free(buf);
+        return FALSE;
+    }
+
+    DWORD wrote = 0;
+    BOOL ok = WriteFile(h, buf, (DWORD)len, &wrote, NULL) &&
+              wrote == (DWORD)len && FlushFileBuffers(h);
+    CloseHandle(h);
+
+    if (!ok || !MoveFileExW(wtmp, wpath,
+                            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(wtmp);
+        free(buf);
+        return FALSE;
+    }
+
+    free(buf);
     return TRUE;
 }
 

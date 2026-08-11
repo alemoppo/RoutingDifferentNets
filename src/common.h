@@ -35,4 +35,30 @@
 /* Conteggio massimo di interfacce visibili. */
 #define NET_MAX_IFACES 32
 
+/* ------------------------------------------------------------ logging debug
+ * Log diagnostico minimale, attivo SOLO con -DNRM_DEBUG in compilazione.
+ * Nella build Release (senza il flag) le chiamate dbg() sono no-op senza
+ * alcun costo: nessun I/O su disco. Non introduce polling: vengono loggati
+ * solo gli eventi che il programma gestisce comunque. */
+#ifdef NRM_DEBUG
+#include <stdarg.h>
+static inline void dbg(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    char p[MAX_PATH];
+    const char *t = getenv("TEMP");
+    snprintf(p, sizeof p, "%s\\nrm_debug.log", (t && *t) ? t : ".");
+    FILE *f = fopen(p, "a");
+    if (f) {
+        vfprintf(f, fmt, ap);
+        fputc('\n', f);
+        fclose(f);
+    }
+    va_end(ap);
+}
+#else
+#define dbg(...) ((void)0)
+#endif
+
 #endif /* COMMON_H */

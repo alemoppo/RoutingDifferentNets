@@ -1,11 +1,22 @@
 /*
  * routes.c - gestione delle route IPv4.
  *
+ * Concetto: RoutingDifferentNets gestisce ESCLUSIVAMENTE gli IP configurati
+ * dall'utente. Una route e' considerata "corretta" solo se destination,
+ * prefix, ifIndex E gateway coincidono con i parametri correnti dell'
+ * interfaccia configurata. Se Windows contiene piu' route /32 verso lo stesso
+ * IP (es. una VPN), quella di RoutingDifferentNets coesiste senza cancellare
+ * le altre: la regola configurata viene preferita grazie alla massima
+ * specificita' (/32) e alla metrica bassa.
+ *
  * Strategia:
  *   1. Snapshot della tabella con GetIpForwardTable2.
- *   2. Creazione persistenta con route.exe -p (CreateProcessW, niente shell).
- *   3. Rinforzo nativo con CreateIpForwardEntry2 se la route non compare.
- *   4. Rimozione con route.exe delete + sweep nativo DeleteIpForwardEntry2.
+ *   2. Creazione dell'route attiva con CreateIpForwardEntry2 (API nativa,
+ *      nessuna attesa bloccante).
+ *   3. Persistenza con route.exe -p lanciato in modo ASINCRONO
+ *      (CreateProcessW, CREATE_NO_WINDOW, niente shell, nessun blocco GUI).
+ *   4. Rimozione con corrispondenza ESATTA tramite DeleteIpForwardEntry2 e
+ *      route.exe delete specifico per gateway.
  *
  * Tutti i parametri testuali (indirizzi IPv4) passano attraverso
  * net_valid_ipv4 prima di finire nella command line, quindi non e' possibile
@@ -55,17 +66,22 @@ BOOL routes_snapshot(RouteList *out)
     return TRUE;
 }
 
-BOOL routes_find_host(const RouteList *l, const char *dest,
-                      unsigned long *ifindex, char *gateway, size_t gwsz)
+/* Corrispondenza esatta: destination + prefix + ifIndex + gateway. */
+BOOL routes_find_host_exact(const RouteList *l, const char *dest,
+                            unsigned long prefix, unsigned long ifindex,
+                            const char *gateway)
 {
     for (int i = 0; i < l->count; i++) {
         const HostRoute *hr = &l->items[i];
-        if (hr->prefix_len == 32 && strcmp(hr->ip, dest) == 0) {
-            if (ifindex)  *ifindex  = hr->ifindex;
-            if (gateway && gwsz)
-                snprintf(gateway, gwsz, "%s", hr->gateway);
-            return TRUE;
-        }
+        if (hr->prefix_len != prefix)
+            continue;
+        if (strcmp(hr->ip, dest) != 0)
+            continue;
+        if (hr->ifindex != ifindex)
+            continue;
+        if (gateway && gateway[0] && strcmp(hr->gateway, gateway) != 0)
+            continue;
+        return TRUE;
     }
     return FALSE;
 }
@@ -88,9 +104,12 @@ BOOL net_valid_ipv4(const char *s)
     return InetPtonA(AF_INET, s, &a) == 1;
 }
 
-/* ------------------------------------------------------- esecuzione route */
+/* ------------------------------------------------------------ route.exe (async) */
 
-static BOOL run_route_cli(const wchar_t *cmdline)
+/* Lancia route.exe con la command line data, SENZA attendere il termine:
+ * la route attiva viene creata/rimossa con le API native; route.exe serve
+ * solo alla persistenza tra riavvii e non deve mai bloccare la GUI. */
+static void run_route_cli_async(const wchar_t *cmdline)
 {
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
@@ -101,34 +120,34 @@ static BOOL run_route_cli(const wchar_t *cmdline)
     /* CREATE_NO_WINDOW: nessuna console lampeggiante, nessuna shell. */
     if (!CreateProcessW(NULL, (LPWSTR)cmdline, NULL, NULL, FALSE,
                         CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
-        return FALSE;
-
-    WaitForSingleObject(pi.hProcess, 30000);
-    DWORD code = 0;
-    GetExitCodeProcess(pi.hProcess, &code);
+        return;
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
-    return code == 0;
 }
 
-/* Costruisce la command line di route.exe in modo sicuro:
- * gli unici parametri variabili sono IPv4 validate o numeri. */
-static BOOL route_cli_persistent_add(const char *ip, const char *gateway,
+/* route -p add: voce persistente che sopravvive al riavvio. */
+static void route_cli_persistent_add(const char *ip, const char *gateway,
                                      unsigned long ifindex)
 {
     wchar_t cmd[512];
     swprintf(cmd, 512,
              L"route -p add %S mask 255.255.255.255 %S if %lu",
              ip, gateway, ifindex);
-    return run_route_cli(cmd);
+    run_route_cli_async(cmd);
 }
 
-static BOOL route_cli_delete(const char *ip)
+/* route delete con gateway: rimuove la voce persistente che corrisponde
+ * a destination+mask+gateway, lasciando intatte eventuali route persistenti
+ * di terze parti verso lo stesso IP ma con gateway diverso. */
+static void route_cli_delete(const char *ip, const char *gateway)
 {
-    wchar_t cmd[384];
-    swprintf(cmd, 384, L"route delete %S mask 255.255.255.255", ip);
-    run_route_cli(cmd);        /* exit code non affidabile se route assente */
-    return TRUE;
+    wchar_t cmd[512];
+    if (gateway && gateway[0])
+        swprintf(cmd, 512, L"route delete %S mask 255.255.255.255 %S",
+                 ip, gateway);
+    else
+        swprintf(cmd, 512, L"route delete %S mask 255.255.255.255", ip);
+    run_route_cli_async(cmd);
 }
 
 /* ------------------------------------------------------ API native (netio) */
@@ -149,6 +168,7 @@ static BOOL route_nio_add(const char *ip, const char *gateway,
 
     row.InterfaceLuid.Value = 0;
     row.InterfaceIndex      = ifindex;
+    /* Metrica minima: tra piu' route /32 verso lo stesso IP vince la nostra. */
     row.Metric              = 1;
 
     row.NextHop.si_family = AF_INET;
@@ -166,7 +186,11 @@ static BOOL route_nio_add(const char *ip, const char *gateway,
     return CreateIpForwardEntry2(&row) == NO_ERROR;
 }
 
-static BOOL route_nio_delete_matching(const char *ip)
+/* Elimina le route attive che corrispondono ESATTAMENTE a
+ * destination+prefix+ifIndex+gateway: non tocca altre route verso lo stesso
+ * IP (es. quelle di una VPN). */
+static BOOL route_nio_delete_exact(const char *ip, unsigned long prefix,
+                                   unsigned long ifindex, const char *gateway)
 {
     MIB_IPFORWARD_TABLE2 *tab = NULL;
     if (GetIpForwardTable2(AF_INET, &tab) != NO_ERROR)
@@ -175,15 +199,25 @@ static BOOL route_nio_delete_matching(const char *ip)
     BOOL ok = TRUE;
     for (DWORD i = 0; i < tab->NumEntries; i++) {
         MIB_IPFORWARD_ROW2 *r = &tab->Table[i];
-        if (r->DestinationPrefix.PrefixLength != 32)
+        if (r->DestinationPrefix.PrefixLength != prefix)
             continue;
-        char dest[INET_ADDRSTRLEN];
+        if (r->InterfaceIndex != ifindex)
+            continue;
         if (r->DestinationPrefix.Prefix.si_family != AF_INET)
             continue;
+        char dest[INET_ADDRSTRLEN];
         InetNtopA(AF_INET, &r->DestinationPrefix.Prefix.Ipv4.sin_addr,
                   dest, sizeof(dest));
         if (strcmp(dest, ip) != 0)
             continue;
+        if (gateway && gateway[0]) {
+            char g[INET_ADDRSTRLEN];
+            if (r->NextHop.si_family != AF_INET)
+                continue;
+            InetNtopA(AF_INET, &r->NextHop.Ipv4.sin_addr, g, sizeof(g));
+            if (strcmp(g, gateway) != 0)
+                continue;
+        }
         if (DeleteIpForwardEntry2(r) != NO_ERROR)
             ok = FALSE;
     }
@@ -203,40 +237,42 @@ BOOL route_add_persistent(const char *ip, const char *gateway,
         return FALSE;
     }
 
-    /* 1) Se la route corretta e' gia' presente non serve fare nulla. */
+    /* 1) Route gia' esattamente corretta: nessuna operazione. */
     RouteList snap;
-    if (routes_snapshot(&snap)) {
-        unsigned long ii; char gw[NET_IP_MAX];
-        if (routes_find_host(&snap, ip, &ii, gw, sizeof gw) &&
-            strcmp(gw, gateway) == 0) {
-            return TRUE;   /* gia' attiva e corretta (indipendente da ifindex) */
-        }
+    if (routes_snapshot(&snap) &&
+        routes_find_host_exact(&snap, ip, 32, ifindex, gateway)) {
+        dbg("[ROUTE] %s/32 OK (gia' presente)", ip);
+        return TRUE;
     }
 
-    /* 2) route.exe -p: route persistente che sopravvive a riavvio. */
-    BOOL cli_ok = route_cli_persistent_add(ip, gateway, ifindex);
-
-    /* 3) Verifica reale in tabella; se manca, rinforzo nativo. */
+    /* 2) Creazione nativa della route attiva (senza attese bloccanti). */
+    BOOL ok = FALSE;
     for (int attempt = 0; attempt < 2; attempt++) {
-        if (routes_snapshot(&snap)) {
-            unsigned long ii; char gw[NET_IP_MAX];
-            if (routes_find_host(&snap, ip, &ii, gw, sizeof gw) &&
-                strcmp(gw, gateway) == 0) {
-                return TRUE;   /* presente e corretta */
+        if (route_nio_add(ip, gateway, ifindex)) {
+            if (routes_snapshot(&snap) &&
+                routes_find_host_exact(&snap, ip, 32, ifindex, gateway)) {
+                ok = TRUE;
+                break;
             }
         }
-        if (!route_nio_add(ip, gateway, ifindex))
-            break;
     }
 
-    if (err) {
-        snprintf(err, errsz, "creazione route fallita (cli_ok=%d)",
-                 cli_ok ? 1 : 0);
+    /* 3) Persistenza asincrona: non bloccante per la GUI. */
+    if (ok)
+        route_cli_persistent_add(ip, gateway, ifindex);
+
+    if (ok) {
+        dbg("[ROUTE] %s/32 aggiunta via %s (if %lu)", ip, gateway, ifindex);
+        return TRUE;
     }
+    if (err)
+        snprintf(err, errsz, "creazione route %s/32 fallita", ip);
+    dbg("[ROUTE] %s/32 ERRORE in creazione", ip);
     return FALSE;
 }
 
-BOOL route_delete(const char *ip, char *err, size_t errsz)
+BOOL route_delete(const char *ip, const char *gateway, unsigned long ifindex,
+                  char *err, size_t errsz)
 {
     if (err) err[0] = '\0';
     if (!net_valid_ipv4(ip)) {
@@ -244,14 +280,16 @@ BOOL route_delete(const char *ip, char *err, size_t errsz)
         return FALSE;
     }
 
-    route_cli_delete(ip);          /* rimuove anche la voce persistente */
-    route_nio_delete_matching(ip); /* sweep nativo della voce attiva     */
+    if (gateway && gateway[0] && ifindex != 0) {
+        /* Rimozione precisa della sola route gestita (attiva + persistente). */
+        route_nio_delete_exact(ip, 32, ifindex, gateway);
+        route_cli_delete(ip, gateway);
+        dbg("[ROUTE] %s/32 eliminata (if %lu gw %s)", ip, ifindex, gateway);
+    } else {
+        /* ifIndex/gateway non noti (interfaccia assente): si rimuove solo la
+         * voce persistente, senza cancellare route attive di terze parti. */
+        route_cli_delete(ip, NULL);
+        dbg("[ROUTE] %s/32: voce persistente rimossa (gw ignoto)", ip);
+    }
     return TRUE;
-}
-
-BOOL route_apply_rule(const char *ip, const char *gateway,
-                      unsigned long ifindex, char *err, size_t errsz)
-{
-    route_delete(ip, NULL, 0);
-    return route_add_persistent(ip, gateway, ifindex, err, errsz);
 }

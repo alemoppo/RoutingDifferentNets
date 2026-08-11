@@ -37,10 +37,13 @@ typedef struct {
 /* Snapshot della tabella di routing IPv4 corrente. */
 BOOL routes_snapshot(RouteList *out);
 
-/* Cerca una route di host (mask /32) verso 'dest'. Ritorna TRUE se esiste e
- * riempie ifindex/gateway. */
-BOOL routes_find_host(const RouteList *l, const char *dest,
-                      unsigned long *ifindex, char *gateway, size_t gwsz);
+/* Cerca una route esattamente corrispondente a destination+prefix+ifIndex+
+ * gateway. Windows puo' contenere piu' route /32 verso lo stesso IP (es. una
+ * VPN): una route gestita da RoutingDifferentNets e' "corretta" SOLO se TUTTI
+ * i parametri coincidono. Ritorna TRUE se esiste una corrispondenza esatta. */
+BOOL routes_find_host_exact(const RouteList *l, const char *dest,
+                            unsigned long prefix, unsigned long ifindex,
+                            const char *gateway);
 
 /* ifindex dell'interfaccia sulla quale passa la default route (0.0.0.0/0),
  * oppure 0 se non presente. */
@@ -49,17 +52,22 @@ unsigned long routes_default_ifindex(const RouteList *l);
 /* Verifica che una stringa sia un indirizzo IPv4 valido. */
 BOOL net_valid_ipv4(const char *s);
 
-/* Crea una route host persistenta e attiva: ip/32 -> gateway via ifindex.
- * Verifica la presenza effettiva in tabella e, se necessario, usa
- * CreateIpForwardEntry2 come rinforzo nativo. */
+/* Crea una route host attiva: ip/32 -> gateway via ifindex.
+ * - Verifica la presenza ESATTA in tabella e, se assente, la crea con
+ *   CreateIpForwardEntry2 (nativo, senza bloccare la GUI).
+ * - La persistenza oltre il riavvio viene delegata a route.exe -p lanciato
+ *   in modo asincrono (nessuna attesa bloccante).
+ * Se esiste gia' una route diversa verso lo stesso IP (es. VPN) non viene
+ * toccata: le route possono coesistere e la /32 con metrica bassa prevale. */
 BOOL route_add_persistent(const char *ip, const char *gateway,
                           unsigned long ifindex, char *err, size_t errsz);
 
-/* Rimuove la route host verso 'ip' (persistente e attiva). */
-BOOL route_delete(const char *ip, char *err, size_t errsz);
-
-/* Remove + add: usata per correggere una route conflittuale. */
-BOOL route_apply_rule(const char *ip, const char *gateway,
-                      unsigned long ifindex, char *err, size_t errsz);
+/* Rimuove SOLO la route gestita, con corrispondenza esatta
+ * destination+prefix+ifIndex+gateway (attiva e persistente).
+ * Se gateway/ifIndex non sono noti (es. interfaccia assente) viene rimossa
+ * l'eventuale voce persistente con `route.exe delete`, lasciando intatte le
+ * route attive di terze parti. */
+BOOL route_delete(const char *ip, const char *gateway, unsigned long ifindex,
+                  char *err, size_t errsz);
 
 #endif /* ROUTES_H */

@@ -181,3 +181,13 @@ int net_index_of(const NetList *l, const NetInterface *p)
     return (int)(p - l->items);
 }
 
+int net_index_of_ifindex(const NetList *l, unsigned long ifindex)
+{
+    if (ifindex == 0)
+        return -1;
+    for (int i = 0; i < l->count; i++)
+        if (l->items[i].ifindex == ifindex)
+            return i;
+    return -1;
+}
+

@@ -45,4 +45,9 @@ const NetInterface *net_resolve(const NetList *l, const char *guid, const char *
 /* Indice (0..count-1) dell'interfaccia puntata da p, oppure -1. */
 int net_index_of(const NetList *l, const NetInterface *p);
 
+/* Indice (0..count-1) dell'interfaccia con quel ifIndex (anche disconnessa),
+ * oppure -1. Utile per mappare una route (che porta solo l'ifIndex) alla
+ * relativa interfaccia/GUID. */
+int net_index_of_ifindex(const NetList *l, unsigned long ifindex);
+
 #endif /* NETWORK_H */

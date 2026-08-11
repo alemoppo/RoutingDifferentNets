@@ -360,6 +360,8 @@ static void dlg_append(App *a, const char *txt)
 
 static void reconcile(App *a, int force)
 {
+    (void)force;   /* le correzioni sono automatiche ed event-driven */
+
     net_snapshot(&a->nets);
     routes_snapshot(&a->routes);
 
@@ -393,71 +395,63 @@ static void reconcile(App *a, int force)
             continue;
         }
 
-        unsigned long ii = 0;
-        char gw[NET_IP_MAX];
-        BOOL found = routes_find_host(&a->routes, it->ip, &ii, gw, sizeof(gw));
+        /* Una route e' "gestita" e corretta solo se destination, prefix,
+         * ifIndex E gateway coincidono con i parametri correnti. */
+        if (routes_find_host_exact(&a->routes, it->ip, 32, ni->ifindex,
+                                   ni->gateway)) {
+            snprintf(a->actual_if[j], sizeof(a->actual_if[j]), "%s",
+                     ni->friendly_name);
+            a->st[j] = ROUTE_STATUS_OK; nok++;
+            dbg("[ROUTE] %s/32 OK (if %lu gw %s)", it->ip, ni->ifindex,
+                ni->gateway);
+            continue;
+        }
 
-        if (found) {
-            if (ii == ni->ifindex) {
+        /* Non esatta: rimuoviamo le eventuali route OBSOLETE che appartengono
+         * alla nostra interfaccia (stesso GUID) o che puntano a un ifIndex non
+         * piu' presente (es. cambiato dopo un tethering). Le route di terze
+         * parti (es. VPN) NON vengono toccate. */
+        char eb[256];
+        int stale = 0;
+        for (int k = 0; k < a->routes.count; k++) {
+            const HostRoute *hr = &a->routes.items[k];
+            if (hr->prefix_len != 32 || strcmp(hr->ip, it->ip) != 0)
+                continue;
+            int idx = net_index_of_ifindex(&a->nets, hr->ifindex);
+            int ours = (idx < 0) ||
+                       (a->nets.items[idx].guid[0] &&
+                        _stricmp(a->nets.items[idx].guid, it->guid) == 0);
+            if (!ours)
+                continue;   /* route di un'altra interfaccia: la lasciamo */
+            route_delete(it->ip, hr->gateway, hr->ifindex, eb, sizeof(eb));
+            stale = 1;
+        }
+        if (stale)
+            routes_snapshot(&a->routes);   /* aggiorna dopo le cancellazioni */
+
+        /* Ricrea con i parametri correnti dell'interfaccia. */
+        if (route_add_persistent(it->ip, ni->gateway, ni->ifindex,
+                                 eb, sizeof(eb))) {
+            routes_snapshot(&a->routes);
+            if (routes_find_host_exact(&a->routes, it->ip, 32, ni->ifindex,
+                                       ni->gateway)) {
                 snprintf(a->actual_if[j], sizeof(a->actual_if[j]), "%s",
                          ni->friendly_name);
-            } else {
-                for (int k = 0; k < a->nets.count; k++)
-                    if (a->nets.items[k].ifindex == ii)
-                        snprintf(a->actual_if[j], sizeof(a->actual_if[j]),
-                                 "%s", a->nets.items[k].friendly_name);
-            }
-            if (!a->actual_if[j][0])
-                snprintf(a->actual_if[j], sizeof(a->actual_if[j]),
-                         "ifIndex %lu", ii);
-
-            if (ii == ni->ifindex && strcmp(gw, ni->gateway) == 0) {
                 a->st[j] = ROUTE_STATUS_OK; nok++;
-            } else if (force) {           /* APPLY esplicito */
-                char eb[256];
-                if (route_apply_rule(it->ip, ni->gateway, ni->ifindex,
-                                     eb, sizeof(eb))) {
-                    routes_snapshot(&a->routes);
-                    if (routes_find_host(&a->routes, it->ip, &ii, gw,
-                                         sizeof(gw)) &&
-                        strcmp(gw, ni->gateway) == 0) {
-                        a->st[j] = ROUTE_STATUS_OK; nok++;
-                    } else {
-                        a->st[j] = ROUTE_STATUS_ERROR;
-                        snprintf(a->reason[j], sizeof(a->reason[j]),
-                                 "applicazione fallita");
-                        nerr++;
-                    }
-                } else {
-                    a->st[j] = ROUTE_STATUS_ERROR;
-                    snprintf(a->reason[j], sizeof(a->reason[j]), "%s",
-                             eb[0] ? eb : "errore");
-                    nerr++;
-                }
+                dbg("[ROUTE] %s/32 corretta -> %s (if %lu gw %s)",
+                    it->ip, ni->friendly_name, ni->ifindex, ni->gateway);
             } else {
-                a->st[j] = ROUTE_STATUS_WRONG_INTERFACE; nwrg++;
+                a->st[j] = stale ? ROUTE_STATUS_WRONG_INTERFACE
+                                 : ROUTE_STATUS_MISSING;
+                snprintf(a->reason[j], sizeof(a->reason[j]),
+                         "route non confermata");
+                if (stale) nwrg++; else nmiss++;
             }
-        } else {                           /* ricreo con parametri attuali */
-            char eb[256];
-            if (route_add_persistent(it->ip, ni->gateway, ni->ifindex,
-                                     eb, sizeof(eb))) {
-                routes_snapshot(&a->routes);
-                if (routes_find_host(&a->routes, it->ip, &ii, gw,
-                                     sizeof(gw)) &&
-                    strcmp(gw, ni->gateway) == 0) {
-                    a->st[j] = ROUTE_STATUS_OK; nok++;
-                } else {
-                    a->st[j] = ROUTE_STATUS_MISSING;
-                    snprintf(a->reason[j], sizeof(a->reason[j]),
-                             "route non confermata");
-                    nmiss++;
-                }
-            } else {
-                a->st[j] = ROUTE_STATUS_ERROR;
-                snprintf(a->reason[j], sizeof(a->reason[j]), "%s",
-                         eb[0] ? eb : "creazione fallita");
-                nerr++;
-            }
+        } else {
+            a->st[j] = ROUTE_STATUS_ERROR;
+            snprintf(a->reason[j], sizeof(a->reason[j]), "%s",
+                     eb[0] ? eb : "creazione fallita");
+            nerr++;
         }
     }
 
@@ -824,6 +818,8 @@ static void draw_dialog(App *a)
 
 /* ====================================================== azioni dialogo */
 
+static void delete_owned_routes(App *a, const char *ip, const char *guid);
+
 static void dialog_open(App *a, int edit_idx)
 {
     a->dlg = TRUE;
@@ -864,26 +860,41 @@ static void dialog_submit(App *a)
                      "Indirizzo non valido: '%s'", ip[0] ? ip : "(vuoto)");
             return;
         }
-        const char *old = a->cfg->items[a->dlg_edit].ip;
+        RouteConfigItem *oit = &a->cfg->items[a->dlg_edit];
+        const char *old = oit->ip;
+        BOOL iface_changed = _stricmp(oit->guid, ni->guid) != 0;
+
         if (strcmp(old, ip) != 0) {
             if (cfg_find(a->cfg, ip) >= 0) {
                 snprintf(a->dlg_msg, sizeof(a->dlg_msg),
                          "IP gia' configurato: %s", ip);
                 return;
             }
+            /* L'IP cambia: la vecchia route non deve restare orfana. */
+            delete_owned_routes(a, old, oit->guid);
             cfg_remove(a->cfg, old);
             if (!cfg_add(a->cfg, ip, ni->friendly_name, ni->guid)) {
                 snprintf(a->dlg_msg, sizeof(a->dlg_msg),
                          "Impossibile aggiungere %s", ip);
                 return;
             }
+        } else if (iface_changed) {
+            /* Cambia solo l'interfaccia: rimuovi la route sulla vecchia
+             * interfaccia, poi aggiorna la regola (nessuna seconda regola). */
+            delete_owned_routes(a, old, oit->guid);
+            cfg_update(a->cfg, ip, ni->friendly_name, ni->guid);
         } else {
             cfg_update(a->cfg, ip, ni->friendly_name, ni->guid);
         }
-        cfg_save(a->cfg);
-        a->dlg = FALSE;
-        a->dlg_drop = FALSE;
-        reconcile(a, 0);
+        if (cfg_save(a->cfg)) {
+            a->dlg = FALSE;
+            a->dlg_drop = FALSE;
+            reconcile(a, 0);
+        } else {
+            snprintf(a->dlg_msg, sizeof(a->dlg_msg),
+                     "ERRORE: salvataggio configurazione fallito.");
+            dbg("[CFG] salvataggio fallito dopo EDIT");
+        }
         return;
     }
 
@@ -899,10 +910,15 @@ static void dialog_submit(App *a)
                      "Limite regole raggiunto.");
             return;
         }
-        cfg_save(a->cfg);
-        a->dlg = FALSE;
-        a->dlg_drop = FALSE;
-        reconcile(a, 0);
+        if (cfg_save(a->cfg)) {
+            a->dlg = FALSE;
+            a->dlg_drop = FALSE;
+            reconcile(a, 0);
+        } else {
+            snprintf(a->dlg_msg, sizeof(a->dlg_msg),
+                     "ERRORE: salvataggio configurazione fallito.");
+            dbg("[CFG] salvataggio fallito dopo ADD");
+        }
         return;
     }
 
@@ -934,19 +950,25 @@ static void dialog_submit(App *a)
                  "Tutti gli IP del processo sono gia' configurati.");
         return;
     }
-    cfg_save(a->cfg);
-    a->dlg_msg[0] = '\0';
-    a->dlg = FALSE;
-    a->dlg_drop = FALSE;
-    reconcile(a, 0);
+    if (cfg_save(a->cfg)) {
+        a->dlg_msg[0] = '\0';
+        a->dlg = FALSE;
+        a->dlg_drop = FALSE;
+        reconcile(a, 0);
+    } else {
+        snprintf(a->dlg_msg, sizeof(a->dlg_msg),
+                 "ERRORE: salvataggio configurazione fallito.");
+        dbg("[CFG] salvataggio fallito dopo ADD processo");
+    }
 }
 
 /* ============================================================ azioni UI */
 
-/* Adotta nella configurazione le route host /32 presenti nel sistema il cui
- * next hop coincide con il gateway di una delle interfacce note: in pratica
- * importa le regole create manualmente (es. route add / New-NetRoute).
- * Chiamata da REFRESH (pulsante e F5); il reconcile lo esegue il chiamante. */
+/* Adotta nella configurazione le route host /32 presenti nel sistema:
+ * la correlazione route -> interfaccia avviene PRIMARIAMENTE tramite
+ * route.ifIndex -> adapter -> GUID (il gateway e' solo una verifica
+ * aggiuntiva, per il caso di piu' interfacce con gateway uguale).
+ * Ritorna il numero di route adottate, oppure -1 se il salvataggio fallisce. */
 static int import_system_routes(App *a)
 {
     routes_snapshot(&a->routes);
@@ -954,17 +976,17 @@ static int import_system_routes(App *a)
     int added = 0;
     for (int i = 0; i < a->routes.count; i++) {
         const HostRoute *hr = &a->routes.items[i];
-        if (hr->prefix_len != 32 || !hr->gateway[0])
+        if (hr->prefix_len != 32 || hr->ifindex == 0)
             continue;
 
-        const NetInterface *ni = NULL;
-        for (int k = 0; k < a->nets.count; k++)
-            if (strcmp(a->nets.items[k].gateway, hr->gateway) == 0) {
-                ni = &a->nets.items[k];
-                break;
-            }
-        if (!ni)
-            continue; /* next hop di un gateway che non gestiamo */
+        /* Correlazione primaria: ifIndex della route -> interfaccia nota. */
+        int idx = net_index_of_ifindex(&a->nets, hr->ifindex);
+        if (idx < 0)
+            continue;
+        const NetInterface *ni = &a->nets.items[idx];
+        if (hr->gateway[0] && ni->gateway[0] &&
+            strcmp(hr->gateway, ni->gateway) != 0)
+            continue;   /* verifica aggiuntiva: gateway incompatibile */
 
         if (cfg_find(a->cfg, hr->ip) >= 0)
             continue; /* gia' adottata */
@@ -972,9 +994,31 @@ static int import_system_routes(App *a)
             added++;
     }
 
-    if (added > 0)
-        cfg_save(a->cfg);
+    if (added > 0 && !cfg_save(a->cfg))
+        return -1;
     return added;
+}
+
+/* Elimina le route /32 verso `ip` che appartengono all'interfaccia `guid`
+ * (stesso GUID) oppure che puntano a un ifIndex non piu' presente nella rete.
+ * Le route di terze parti (es. VPN) restano intatte. Usata alla rimozione di
+ * una regola quando l'interfaccia e' offline o assente. */
+static void delete_owned_routes(App *a, const char *ip, const char *guid)
+{
+    routes_snapshot(&a->routes);
+    char eb[128];
+    for (int k = 0; k < a->routes.count; k++) {
+        const HostRoute *hr = &a->routes.items[k];
+        if (hr->prefix_len != 32 || strcmp(hr->ip, ip) != 0)
+            continue;
+        int idx = net_index_of_ifindex(&a->nets, hr->ifindex);
+        int ours = (idx < 0) ||
+                   (a->nets.items[idx].guid[0] &&
+                    _stricmp(a->nets.items[idx].guid, guid) == 0);
+        if (!ours)
+            continue;
+        route_delete(ip, hr->gateway, hr->ifindex, eb, sizeof(eb));
+    }
 }
 
 static void cmd_do(App *a, CmdId cmd, int idx)
@@ -994,22 +1038,38 @@ static void cmd_do(App *a, CmdId cmd, int idx)
         break;
     case CMD_REMOVE:
         if (idx >= 0 && idx < a->cfg->count) {
-            const char *ip = a->cfg->items[idx].ip;
+            RouteConfigItem *it = &a->cfg->items[idx];
+            const char *ip = it->ip;
+            const NetInterface *ni = net_resolve(&a->nets, it->guid, it->name);
             char eb[128];
-            route_delete(ip, eb, sizeof(eb));
+            BOOL online = ni && ni->state == NET_CONNECTED &&
+                          ni->gateway[0] && ni->ifindex != 0;
+            if (online)
+                route_delete(ip, ni->gateway, ni->ifindex, eb, sizeof(eb));
+            else
+                delete_owned_routes(a, ip, it->guid);
             cfg_remove(a->cfg, ip);
-            cfg_save(a->cfg);
-            snprintf(a->opmsg, sizeof(a->opmsg),
-                     "Regola %s rimossa, route eliminata.", ip);
+            if (cfg_save(a->cfg)) {
+                snprintf(a->opmsg, sizeof(a->opmsg),
+                         "Regola %s rimossa, route eliminata.", ip);
+            } else {
+                snprintf(a->opmsg, sizeof(a->opmsg),
+                         "ERRORE: salvataggio configurazione fallito.");
+                dbg("[CFG] salvataggio fallito dopo REMOVE");
+            }
             reconcile(a, 0);
         }
         break;
     case CMD_REFRESH: {
         int n = import_system_routes(a);
-        snprintf(a->opmsg, sizeof(a->opmsg),
-                 n > 0 ? "REFRESH: adottate %d route esistenti dal sistema."
-                       : "Refresh eseguito.",
-                 n);
+        if (n < 0)
+            snprintf(a->opmsg, sizeof(a->opmsg),
+                     "ERRORE: salvataggio configurazione fallito.");
+        else
+            snprintf(a->opmsg, sizeof(a->opmsg),
+                     n > 0 ? "REFRESH: adottate %d route esistenti dal sistema."
+                           : "Refresh eseguito.",
+                     n);
         reconcile(a, 0);
         break;
     }

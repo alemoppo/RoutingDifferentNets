@@ -95,10 +95,15 @@ void monitor_stop(NetMon *m)
     if (!m)
         return;
 
+    /* Segnala l'uscita e attende che il thread sia DAVVERO terminato prima
+     * di toccare la struttura: la thread termina cancellando le notifiche e
+     * ritornando; solo dopo possiamo liberare senza rischio di use-after-free.
+     * Il thread si sblocca subito su hExit, quindi l'attesa e' immediata. */
     SetEvent(m->hExit);
     if (m->hThread) {
-        WaitForSingleObject(m->hThread, 2000);
+        WaitForSingleObject(m->hThread, INFINITE);
         CloseHandle(m->hThread);
+        m->hThread = NULL;
     }
     cancel_all(m);
     if (m->hExit)
