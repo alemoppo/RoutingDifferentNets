@@ -29,6 +29,11 @@ typedef struct {
     RouteConfigItem items[CONFIG_MAX_ROUTES];
     int             count;
     char            path[MAX_PATH];
+    /* Notifiche di rete event-driven (Notify*) ATTIVE/DISATTIVATE.
+     * DEFAULT OFF: su macchine col driver RNDIS/tethering instabile (winnsi
+     * puo' dispatchiare un NULL) le notifiche in-process crashano l'app.
+     * Con OFF l'aggiornamento avviene per polling periodico + F5. */
+    BOOL            notify;
 } Config;
 
 /* Percorso predefinito: %LOCALAPPDATA%\NetworkRouteManager\config.json */

@@ -210,6 +210,38 @@ static BOOL js_field_num(const char *beg, const char *end, const char *key,
     return FALSE;
 }
 
+/* Cerca la chiave `key` e parsa un booleano JSON (true/false). */
+static BOOL js_field_bool(const char *beg, const char *end, const char *key,
+                          BOOL *out)
+{
+    char pat[64];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *q = beg;
+    while (q < end) {
+        const char *p = strstr(q, pat);
+        if (!p || p + strlen(pat) >= end)
+            return FALSE;
+        const char *c = p + strlen(pat);
+        while (c < end && (*c == ' ' || *c == '\t' || *c == '\n' || *c == '\r'))
+            c++;
+        if (c >= end || *c != ':')
+            return FALSE;
+        c++;
+        while (c < end && (*c == ' ' || *c == '\t' || *c == '\n' || *c == '\r'))
+            c++;
+        if (c + 4 <= end && strncmp(c, "true", 4) == 0) {
+            *out = TRUE;
+            return TRUE;
+        }
+        if (c + 5 <= end && strncmp(c, "false", 5) == 0) {
+            *out = FALSE;
+            return TRUE;
+        }
+        return FALSE;
+    }
+    return FALSE;
+}
+
 void cfg_load(Config *c, const char *path)
 {
     memset(c, 0, sizeof(*c));
@@ -245,6 +277,12 @@ void cfg_load(Config *c, const char *path)
     const char *root_open = strchr(pos, '{');
     const char *root_close = root_open ? obj_close(root_open + 1, end) : NULL;
     if (root_open && root_close) {
+        /* "notify": default FALSE se assente (appena reinstallata / config
+         * vecchia senza il campo). Il memset iniziale ha gia' messo FALSE. */
+        BOOL ntf = FALSE;
+        js_field_bool(root_open + 1, root_close, "notify", &ntf);
+        c->notify = ntf;
+
         const char *item = root_open + 1;
         while (item < root_close) {
             const char *open = strchr(item, '{');
@@ -327,7 +365,8 @@ BOOL cfg_save(const Config *c)
     char eguid[NET_GUID_MAX * 6 + 4], egw[NET_IP_MAX * 6 + 4];
 
     size_t p = 0;
-    int r = snprintf(buf + p, cap - p, "{\n  \"routes\": [\n");
+    int r = snprintf(buf + p, cap - p, "{\n  \"notify\": %s,\n  \"routes\": [\n",
+                     c->notify ? "true" : "false");
     if (r < 0 || (size_t)r >= cap - p) { free(buf); return FALSE; }
     p += (size_t)r;
 

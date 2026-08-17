@@ -45,7 +45,8 @@ typedef enum {
     CMD_DLG_ADD,
     CMD_DLG_CANCEL,
     CMD_DLG_DROP,
-    CMD_DLG_NET
+    CMD_DLG_NET,
+    CMD_TOGGLE_NOTIFY
 } CmdId;
 
 typedef struct { SDL_Rect r; CmdId cmd; int idx; } Hit;
@@ -86,6 +87,8 @@ typedef struct {
     char          dlg_msg[160];
 
     char          opmsg[200];
+
+    NetMon        *mon;     /* monitor notifiche rete (NULL se disattivato) */
 } App;
 
 /* colori (0xAARRGGBB) */
@@ -816,8 +819,11 @@ static void draw_statusbar(App *a)
                           : "Pronto - le route persistenti vengono ricreate "
                             "automaticamente",
               C_DIM, 1);
-    draw_text(a, a->w - 2 * MARGIN - text_w("F5 refresh", 1),
-              a->h - BOTTOM + 9, "F5 refresh", C_GRAY, 1);
+    char right[64];
+    snprintf(right, sizeof(right), "%s (F8)   F5 refresh",
+             a->cfg->notify ? "notif:ON" : "notif:OFF");
+    draw_text(a, a->w - 2 * MARGIN - text_w(right, 1),
+              a->h - BOTTOM + 9, right, C_GRAY, 1);
 }
 
 /* ============================================================== dialogo */
@@ -1139,6 +1145,10 @@ static BOOL delete_owned_routes(App *a, const char *ip, const char *guid)
     return ok;
 }
 
+/* on_net_change e' definita piu' avanti (sezione eventi), ma cmd_do la usa
+ * per riavviare il monitor al toggle F8. */
+static void on_net_change(void *user);
+
 static void cmd_do(App *a, CmdId cmd, int idx)
 {
     switch (cmd) {
@@ -1206,6 +1216,25 @@ static void cmd_do(App *a, CmdId cmd, int idx)
         reconcile(a, 0);
         break;
     }
+    case CMD_TOGGLE_NOTIFY:
+        a->cfg->notify = !a->cfg->notify;
+        if (a->cfg->notify) {
+            if (!a->mon)
+                a->mon = monitor_start(on_net_change, a);
+            snprintf(a->opmsg, sizeof(a->opmsg),
+                     "NOTIFICA: notifiche di rete ATTIVE (F8 per disattivare).");
+            dbg("[GUI] notifiche di rete ATTIVE");
+        } else {
+            if (a->mon) {
+                monitor_stop(a->mon);
+                a->mon = NULL;
+            }
+            snprintf(a->opmsg, sizeof(a->opmsg),
+                     "NOTIFICA: notifiche OFF - aggiornamento per polling (F8).");
+            dbg("[GUI] notifiche di rete OFF");
+        }
+        cfg_save(a->cfg);
+        break;
     case CMD_DLG_ADD:
         dialog_submit(a);
         break;
@@ -1390,6 +1419,10 @@ static void handle_event(App *a, SDL_Event *e)
             cmd_do(a, CMD_REFRESH, -1);
             a->redraw = TRUE;
         }
+        if (e->key.key == SDLK_F8) {
+            cmd_do(a, CMD_TOGGLE_NOTIFY, -1);
+            a->redraw = TRUE;
+        }
         break;
 
     case SDL_EVENT_TEXT_INPUT:
@@ -1458,17 +1491,35 @@ void gui_run(Config *cfg)
     /* snap-compare iniziale: enumera e crea le route mancanti */
     reconcile(&a, 0);
 
-    NetMon *mon = monitor_start(on_net_change, &a);
+    /* Monitor notifiche: SOLO se attivo in config. Su macchine col driver
+     * RNDIS/tethering instabile le notifiche in-process crashano l'app
+     * (winnsi dispatch NULL); di default sono OFF e la UI si aggiorna
+     * per polling periodico + F5. Toggle a runtime: F8. */
+    a.mon = cfg->notify ? monitor_start(on_net_change, &a) : NULL;
+
+    Uint64 last_poll = GetTickCount64();
 
     while (a.running) {
         SDL_Event e;
-        if (SDL_WaitEvent(&e))
+        if (SDL_WaitEventTimeout(&e, 1000))
             handle_event(&a, &e);
 
         /* drena altri eventi (coalesce le notifiche di rete) */
         SDL_Event nxt;
         while (a.running && SDL_PollEvent(&nxt))
             handle_event(&a, &nxt);
+
+        /* Fallback polling: con le notifiche OFF la UI si ri-concilia da sola
+         * ogni 4 s (F5 resta per un refresh immediato). Con le notifiche ON
+         * il wake periodico serve solo a rilevare lo stop: niente reconcile
+         * extra (lo fanno le notifiche). */
+        if (!cfg->notify) {
+            Uint64 now = GetTickCount64();
+            if ((Uint64)(now - last_poll) >= 4000) {
+                last_poll = now;
+                a.need_recon = 1;
+            }
+        }
 
         if (a.need_recon) {
             reconcile(&a, 0);
@@ -1483,7 +1534,10 @@ void gui_run(Config *cfg)
         }
     }
 
-    monitor_stop(mon);
+    if (a.mon) {
+        monitor_stop(a.mon);
+        a.mon = NULL;
+    }
     if (a.canvas) SDL_DestroyTexture(a.canvas);
     if (a.surf)   SDL_DestroySurface(a.surf);
     SDL_DestroyRenderer(a.ren);
